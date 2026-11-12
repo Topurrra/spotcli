@@ -38,6 +38,26 @@ Your browser opens, you approve the access, and credentials are stored in
 refreshed automatically; you only sign in again if Spotify revokes the
 session. `SPOTIFY_CLIENT_ID` works too if you prefer the environment.
 
+## Theming
+
+The interface is drawn from a named-token theme (`src/theme.rs`), ported from
+[OpenTUI](https://github.com/anomalyco/opentui)'s design system: background,
+surface, foreground, muted, accent, border, focus, selection, highlight,
+input, cursor, track, thumb, success, warning, and error. Three palettes ship:
+
+- `dark` - an explicit dark palette that looks the same in every terminal
+- `light` - an explicit light palette
+- `terminal` - inherits the terminal's own 16 colors
+
+```
+spotcli --theme light
+spotcli --theme terminal
+```
+
+The default, `auto`, asks the terminal for its background color over OSC 11
+(the way OpenTUI's renderer theme mode does) and picks dark or light from its
+brightness; if the terminal does not answer, it falls back to dark.
+
 ## Build
 
 ```
