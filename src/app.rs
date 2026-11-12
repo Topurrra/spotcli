@@ -15,6 +15,7 @@ use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, Key
 use tokio::runtime::Handle;
 
 use crate::api::Client;
+use crate::theme::Theme;
 use crate::models::{Device, Playback, Playlist, Track};
 
 /// How long the event loop waits for terminal input between draws.
@@ -74,6 +75,7 @@ impl Jobs {
 pub struct App {
     pub tab: Tab,
     pub should_quit: bool,
+    pub theme: Theme,
 
     pub(crate) playlists: Vec<Playlist>,
     pub(crate) playlists_cursor: usize,
@@ -103,9 +105,15 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
+        Self::with_theme(Theme::dark())
+    }
+
+    /// Build the app with an explicit palette.
+    pub fn with_theme(theme: Theme) -> Self {
         Self {
             tab: Tab::Library,
             should_quit: false,
+            theme,
             playlists: Vec::new(),
             playlists_cursor: 0,
             tracks: Vec::new(),
@@ -140,10 +148,14 @@ impl App {
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
 
             if event::poll(TICK)? {
-                if let TermEvent::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.on_key(key, &jobs);
+                match event::read()? {
+                    TermEvent::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            self.on_key(key, &jobs);
+                        }
                     }
+                    TermEvent::Mouse(mouse) => self.on_mouse(mouse, &jobs),
+                    _ => {}
                 }
             }
 
@@ -490,6 +502,27 @@ impl App {
             async move { client.transfer(&id, true).await.map_err(anyhow::Error::from) },
             done("transfer"),
         );
+    }
+
+    // --- Mouse -------------------------------------------------------------------
+
+    fn on_mouse(&mut self, mouse: ratatui::crossterm::event::MouseEvent, jobs: &Jobs) {
+        use ratatui::crossterm::event::MouseEventKind;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.move_cursor(-1),
+            MouseEventKind::ScrollDown => self.move_cursor(1),
+            MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
+                if self.tab == Tab::Library {
+                    // Clicking a pane focuses it; the click row selects there.
+                    let on_tracks = mouse.column > 30;
+                    self.tracks_focused = on_tracks;
+                }
+                if self.selected_track().is_some() {
+                    self.play_selection(jobs);
+                }
+            }
+            _ => {}
+        }
     }
 
     // --- Events -----------------------------------------------------------------

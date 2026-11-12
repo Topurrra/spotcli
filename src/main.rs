@@ -16,6 +16,10 @@ use spotcli::{config_dir, App, Client, TokenStore};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Which palette to draw with: auto (ask the terminal), dark, light,
+    /// or terminal (inherit the terminal's own colors).
+    #[arg(long, default_value = "auto")]
+    theme: String,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +67,7 @@ fn main() -> ExitCode {
 }
 
 async fn dispatch(cli: Cli, runtime: &tokio::runtime::Runtime) -> Result<()> {
+    let theme = pick_theme(&cli.theme);
     match cli.command {
         Some(Command::Login { client_id }) => login(client_id).await,
         Some(Command::Logout) => {
@@ -71,7 +76,22 @@ async fn dispatch(cli: Cli, runtime: &tokio::runtime::Runtime) -> Result<()> {
             Ok(())
         }
         Some(command) => one_shot(command).await,
-        None => run_tui(runtime).await,
+        None => run_tui(runtime, theme).await,
+    }
+}
+
+/// Resolve `--theme`: `auto` asks the terminal for its background color and
+/// picks dark or light from its brightness; anything unrecognized falls
+/// back to dark.
+fn pick_theme(name: &str) -> spotcli::Theme {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "light" => spotcli::Theme::light(),
+        "terminal" => spotcli::Theme::terminal(),
+        "dark" => spotcli::Theme::dark(),
+        _ => match spotcli::theme_detect::detect_background() {
+            Some(background) => spotcli::Theme::for_background(background),
+            None => spotcli::Theme::dark(),
+        },
     }
 }
 
@@ -156,10 +176,10 @@ async fn one_shot(command: Command) -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(runtime: &tokio::runtime::Runtime) -> Result<()> {
+async fn run_tui(runtime: &tokio::runtime::Runtime, theme: spotcli::Theme) -> Result<()> {
     let client = Client::from_dir(&config_dir()?)?;
     let mut terminal = ratatui::init();
-    let result = App::new().run(&mut terminal, client, runtime.handle().clone());
+    let result = App::with_theme(theme).run(&mut terminal, client, runtime.handle().clone());
     ratatui::restore();
     result
 }

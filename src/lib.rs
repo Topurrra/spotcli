@@ -2,12 +2,15 @@ mod api;
 mod app;
 mod auth;
 mod models;
+mod theme;
+pub mod theme_detect;
 mod ui;
 
 pub use api::Client;
 pub use app::App;
 pub use auth::{login, StoredCredentials, TokenStore};
 pub use models::{Device, Playback, Playlist, Track, User};
+pub use theme::Theme;
 
 use anyhow::{Context, Result};
 

@@ -1,21 +1,28 @@
 //! Ratatui rendering for the whole interface.
+//!
+//! Every widget reads [`Theme`] (ported from OpenTUI), uses rounded borders,
+//! and shows a focus ring on the pane the keyboard or mouse is driving.
 
 use std::time::Instant;
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Tabs};
+use ratatui::widgets::{
+    Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Tabs,
+};
 use ratatui::Frame;
 
 use crate::app::{App, Tab, LIKED_KEY};
 use crate::models::{format_duration, Playback};
-
-const ACCENT: Color = Color::Green;
-const DIM: Color = Color::DarkGray;
+use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    let theme = app.theme;
     let area = frame.area();
+
+    frame.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(5),
@@ -24,20 +31,34 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .split(area);
 
-    draw_header(frame, app, chunks[0]);
+    draw_header(frame, app, &theme, chunks[0]);
     match app.tab {
-        Tab::Library => draw_library(frame, app, chunks[1]),
-        Tab::Search => draw_search(frame, app, chunks[1]),
+        Tab::Library => draw_library(frame, app, &theme, chunks[1]),
+        Tab::Search => draw_search(frame, app, &theme, chunks[1]),
     }
-    draw_player(frame, app, chunks[2]);
-    draw_footer(frame, app, chunks[3]);
+    draw_player(frame, app, &theme, chunks[2]);
+    draw_footer(frame, app, &theme, chunks[3]);
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let tabs = Tabs::new(vec!["Library", "Search"])
-        .block(Block::default().borders(Borders::ALL).title(" spotcli "))
-        .style(Style::default().fg(Color::Gray))
-        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(theme.border(false))
+                .title(Span::styled(
+                    " spotcli ",
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .style(theme.muted_text())
+        .highlight_style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+                .underline_color(theme.accent),
+        )
         .select(match app.tab {
             Tab::Library => 0,
             Tab::Search => 1,
@@ -45,26 +66,29 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(tabs, area);
 }
 
-fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_library(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let columns = Layout::horizontal([Constraint::Percentage(30), Constraint::Fill(1)]).split(area);
+
+    let playlists_focused = app.tab == Tab::Library && !app.tracks_focused;
+    let tracks_focused = app.tab == Tab::Library && app.tracks_focused;
 
     let mut playlist_items: Vec<ListItem> = Vec::with_capacity(app.playlists.len() + 1);
     playlist_items.push(ListItem::new(Line::from(Span::styled(
         "Liked Songs",
-        Style::default().fg(ACCENT),
+        Style::default().fg(theme.accent),
     ))));
     for playlist in &app.playlists {
         playlist_items.push(ListItem::new(Line::from(vec![
-            Span::raw(playlist.name.clone()),
+            Span::styled(playlist.name.clone(), theme.text()),
             Span::styled(
                 format!("  {} ({})", playlist.owner, playlist.track_count),
-                Style::default().fg(DIM),
+                theme.muted_text(),
             ),
         ])));
     }
     let playlist_list = List::new(playlist_items)
-        .block(list_block(" Playlists ", app.tab == Tab::Library && !app.tracks_focused))
-        .highlight_style(highlight());
+        .block(block(theme, " Playlists ", playlists_focused))
+        .highlight_style(theme.highlight());
     frame.render_stateful_widget(
         playlist_list,
         columns[0],
@@ -84,35 +108,48 @@ fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
         .tracks
         .iter()
         .enumerate()
-        .map(|(index, track)| track_row(index, track))
+        .map(|(index, track)| track_row(theme, index, track))
         .collect();
     let track_list = List::new(track_items)
-        .block(list_block(&title, app.tab == Tab::Library && app.tracks_focused))
-        .highlight_style(highlight());
+        .block(block(theme, &title, tracks_focused))
+        .highlight_style(theme.highlight());
     frame.render_stateful_widget(track_list, columns[1], &mut list_state(app.tracks_cursor));
 }
 
-fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_search(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let rows = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).split(area);
 
-    let input = Paragraph::new(format!("{}_", app.search_input))
-        .block(list_block(" Search: type, Enter to search ", true));
+    let input = Paragraph::new(Line::from(vec![
+        Span::styled(app.search_input.clone(), theme.text()),
+        Span::styled("_", Style::default().fg(theme.cursor)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(theme.border(true))
+            .title(Span::styled(
+                " Search: type, Enter to run ",
+                Style::default().fg(theme.focus),
+            ))
+            .style(Style::default().bg(theme.input_focused_bg)),
+    );
     frame.render_widget(input, rows[0]);
 
     let items: Vec<ListItem> = app
         .search_results
         .iter()
         .enumerate()
-        .map(|(index, track)| track_row(index, track))
+        .map(|(index, track)| track_row(theme, index, track))
         .collect();
     let results = List::new(items)
-        .block(list_block(" Results ", false))
-        .highlight_style(highlight());
+        .block(block(theme, " Results ", false))
+        .highlight_style(theme.highlight());
     frame.render_stateful_widget(results, rows[1], &mut list_state(app.search_cursor));
 }
 
-fn draw_player(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Now Playing ");
+fn draw_player(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let block = block(theme, " Now Playing ", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -122,7 +159,7 @@ fn draw_player(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "Nothing playing. Press Enter on a track to start.",
-                Style::default().fg(DIM),
+                theme.muted_text(),
             )),
             rows[0],
         );
@@ -151,13 +188,16 @@ fn draw_player(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let left = Line::from(vec![
-        Span::styled(format!("{state_symbol} "), Style::default().fg(ACCENT)),
-        Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" — {artists}"), Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("{state_symbol} "),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(title.to_string(), theme.text().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" — {artists}"), theme.muted_text()),
     ]);
     let right = Line::from(vec![Span::styled(
         format!("{shuffle_symbol} {repeat_symbol}{volume}{device}"),
-        Style::default().fg(DIM),
+        theme.muted_text(),
     )]);
     frame.render_widget(Paragraph::new(left), rows[0]);
     frame.render_widget(
@@ -172,7 +212,7 @@ fn draw_player(frame: &mut Frame, app: &App, area: Rect) {
         0.0
     };
     let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(ACCENT))
+        .gauge_style(Style::default().fg(theme.accent).bg(theme.track))
         .ratio(ratio)
         .label(Span::styled(
             format!(
@@ -180,7 +220,7 @@ fn draw_player(frame: &mut Frame, app: &App, area: Rect) {
                 format_duration(elapsed),
                 format_duration(playback.duration_ms)
             ),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.foreground),
         ));
     frame.render_widget(gauge, rows[1]);
 }
@@ -194,63 +234,63 @@ fn interpolated_progress(playback: &Playback, at: Option<Instant>) -> u64 {
     (playback.progress_ms + elapsed).min(playback.duration_ms)
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if let Some((message, at)) = app.status.as_ref() {
         if at.elapsed() < crate::app::STATUS_TTL {
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    message.clone(),
-                    Style::default().fg(Color::Yellow),
-                )),
+                Paragraph::new(Span::styled(message.clone(), Style::default().fg(theme.warning))),
                 area,
             );
             return;
         }
     }
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "q quit · tab view · enter play · space pause · n/p skip · s shuffle · r repeat · +/- volume · a queue · d device",
-            Style::default().fg(DIM),
-        )),
-        area,
-    );
+    let hints: Vec<Span> = [
+        ("q", "quit"),
+        ("tab", "view"),
+        ("enter", "play"),
+        ("space", "pause"),
+        ("n/p", "skip"),
+        ("s", "shuffle"),
+        ("r", "repeat"),
+        ("+/-", "volume"),
+        ("a", "queue"),
+        ("d", "device"),
+    ]
+    .iter()
+    .flat_map(|(key, action)| {
+        [
+            Span::styled(format!(" {key} "), Style::default().fg(theme.accent)),
+            Span::styled(action.to_string(), theme.muted_text()),
+        ]
+    })
+    .collect();
+    frame.render_widget(Paragraph::new(Line::from(hints)), area);
 }
 
-fn track_row(index: usize, track: &crate::models::Track) -> ListItem<'static> {
+fn track_row(theme: &Theme, index: usize, track: &crate::models::Track) -> ListItem<'static> {
     ListItem::new(Line::from(vec![
-        Span::styled(format!("{:>3}. ", index + 1), Style::default().fg(DIM)),
-        Span::styled(
-            track.name.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {}", track.artists), Style::default().fg(Color::Gray)),
+        Span::styled(format!("{:>3}. ", index + 1), theme.muted_text()),
+        Span::styled(track.name.clone(), theme.text().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {}", track.artists), theme.muted_text()),
         Span::styled(
             format!("  {}", track.duration_label()),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.thumb),
         ),
     ]))
 }
 
-fn list_block(title: &str, focused: bool) -> Block<'_> {
-    let border = if focused {
-        Style::default().fg(ACCENT)
-    } else {
-        Style::default().fg(DIM)
-    };
+/// A rounded panel with a focus ring: the OpenTUI `View` look.
+fn block<'a>(theme: &Theme, title: &str, focused: bool) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(border)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(theme.border(focused))
         .title(Span::styled(
             title.to_string(),
-            Style::default().fg(if focused { ACCENT } else { Color::Gray }),
+            Style::default().fg(if focused { theme.focus } else { theme.foreground })
+                .add_modifier(Modifier::BOLD),
         ))
-}
-
-fn highlight() -> Style {
-    Style::default()
-        .bg(Color::Rgb(30, 30, 30))
-        .fg(ACCENT)
-        .add_modifier(Modifier::BOLD)
+        .style(Style::default().bg(theme.surface))
 }
 
 fn list_state(selected: usize) -> ListState {
