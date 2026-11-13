@@ -196,6 +196,8 @@ pub struct App {
     local_repeat: crate::player::Repeat,
     /// Monotonic id of the latest search; older replies are dropped.
     search_seq: u64,
+    /// The query the shown results (or the in-flight search) belong to.
+    pub(crate) searched_for: String,
     /// When devices were last requested.
     last_devices_at: Instant,
 
@@ -267,6 +269,7 @@ impl App {
             local_shuffle: false,
             local_repeat: crate::player::Repeat::Off,
             search_seq: 0,
+            searched_for: String::new(),
             last_devices_at: Instant::now(),
             picker,
             cover: None,
@@ -503,6 +506,7 @@ impl App {
         if query.is_empty() {
             return;
         }
+        self.searched_for = query.clone();
         self.pending += 1;
         self.search_seq += 1;
         let seq = self.search_seq;
@@ -896,7 +900,17 @@ impl App {
                 self.search_input.clear();
                 self.search_cursor = 0;
             }
-            KeyCode::Enter => self.submit_search(jobs),
+            // A new query searches; on the results of the current one, Enter
+            // plays the selected track.
+            KeyCode::Enter => {
+                if !self.search_results.is_empty()
+                    && self.search_input.trim() == self.searched_for
+                {
+                    self.play_selection(jobs);
+                } else {
+                    self.submit_search(jobs);
+                }
+            }
             KeyCode::Backspace => {
                 self.search_input.pop();
                 self.search_cursor = 0;

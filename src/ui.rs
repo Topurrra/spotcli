@@ -299,11 +299,10 @@ fn hints_for(app: &App) -> &'static [(&'static str, &'static str)] {
             ("q", "quit"),
         ],
         Tab::Search => &[
-            ("enter", "search"),
+            ("enter", "search/play"),
             ("↑↓", "select"),
-            ("tab", "view"),
             ("esc", "clear"),
-            ("v", "view"),
+            ("tab", "view"),
         ],
         Tab::View => &[
             ("enter", "play"),
