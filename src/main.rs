@@ -197,7 +197,17 @@ async fn run_tui(runtime: &tokio::runtime::Runtime, theme: spotcli::Theme) -> Re
     let picker = ratatui_image::picker::Picker::from_query_stdio()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
     let mut terminal = ratatui::init();
+    // Mouse clicks and the wheel drive the lists; release capture on every
+    // exit path, panics included, so the shell gets its mouse back.
+    use ratatui::crossterm::{event::DisableMouseCapture, event::EnableMouseCapture, execute};
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        previous_hook(info);
+    }));
     let result = App::with_theme(theme, picker).run(&mut terminal, client, runtime.handle().clone());
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }

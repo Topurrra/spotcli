@@ -28,7 +28,7 @@ const PLAYBACK_POLL_PLAYING: Duration = Duration::from_secs(2);
 /// ... and while paused or idle.
 const PLAYBACK_POLL_IDLE: Duration = Duration::from_secs(10);
 /// Cover panel size in terminal cells the image protocol is built for.
-const COVER_CELLS: (u16, u16) = (12, 6);
+pub(crate) const COVER_CELLS: (u16, u16) = (12, 6);
 /// How long a transient status message stays on screen.
 pub const STATUS_TTL: Duration = Duration::from_secs(4);
 
@@ -39,6 +39,23 @@ const SEARCH_LIMIT: u32 = 30;
 
 /// The key of the built-in liked-tracks list in the library view.
 pub const LIKED_KEY: &str = "liked";
+
+/// How often to look for Spotify devices while none is active.
+const DEVICE_REFRESH: Duration = Duration::from_secs(30);
+/// Wait this long before retrying a failed View-tab fetch.
+const VIEW_RETRY: Duration = Duration::from_secs(10);
+
+/// Where the View tab's lyrics are in their lifecycle.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum LyricsState {
+    /// A fetch is in flight (or has not been submitted yet).
+    #[default]
+    Loading,
+    /// The fetch finished and there are no lyrics for this track.
+    Missing,
+    /// `App::view_lyrics` holds the lyrics.
+    Ready,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -61,6 +78,12 @@ pub struct MouseZones {
     pub view: ratatui::layout::Rect,
     /// Rows the playlist/tracks list skips before the first entry.
     pub tracks_leading_rows: u16,
+    /// Scroll offsets of each list as last drawn (first visible item index),
+    /// so a click on screen row N maps to item offset + N.
+    pub playlists_offset: usize,
+    pub tracks_offset: usize,
+    pub results_offset: usize,
+    pub view_offset: usize,
 }
 
 /// Where audio comes from: another Spotify device, driven over the Web API,
@@ -77,7 +100,7 @@ pub enum AppEvent {
     Playback(Result<Option<Playback>>),
     Playlists(Result<Vec<Playlist>>),
     Tracks { key: String, tracks: Vec<Track> },
-    SearchResults(Vec<Track>),
+    SearchResults { seq: u64, tracks: Vec<Track> },
     Devices(Vec<Device>),
     Done { action: &'static str, outcome: Result<()> },
     /// The built-in player finished starting up.
@@ -88,6 +111,7 @@ pub enum AppEvent {
     Cover {
         uri: String,
         protocol: Option<ratatui_image::protocol::Protocol>,
+        accent: Option<(u8, u8, u8)>,
     },
     /// Radio continuation tracks for a seed.
     RadioTracks { tracks: Vec<Track> },
@@ -102,6 +126,8 @@ pub enum AppEvent {
         for_track: String,
         lyrics: Option<crate::library::Lyrics>,
     },
+    /// A View-tab fetch failed; `catalog` tells which one.
+    ViewFailed { for_track: String, catalog: bool },
 }
 
 type EventTx = mpsc::Sender<AppEvent>;
@@ -156,8 +182,17 @@ pub struct App {
     /// Playback to begin the moment the built-in player is ready: a
     /// selected track with the list it came from.
     pub(crate) pending_local_start: Option<(Vec<Track>, usize)>,
-    /// A playlist was opened locally; play its first track once loaded.
-    pub(crate) local_playlist_play: bool,
+    /// A playlist was opened locally; play its first track once the list
+    /// with this key has loaded.
+    pub(crate) local_playlist_play: Option<String>,
+    /// The built-in player is being created (guards against duplicates).
+    local_starting: bool,
+    /// Local shuffle state (the player itself cannot unshuffle).
+    local_shuffle: bool,
+    /// Monotonic id of the latest search; older replies are dropped.
+    search_seq: u64,
+    /// When devices were last requested.
+    last_devices_at: Instant,
 
     /// Terminal capability picker (kitty/sixel/halfblocks) from startup.
     pub(crate) picker: ratatui_image::picker::Picker,
@@ -165,6 +200,8 @@ pub struct App {
     pub(crate) cover: Option<(String, ratatui_image::protocol::Protocol)>,
     /// The track uri whose cover fetch is in flight.
     pub(crate) cover_request: Option<String>,
+    /// Accent color sampled from the current cover art, when there is one.
+    pub(crate) cover_accent: Option<ratatui::style::Color>,
 
     pub(crate) zones: MouseZones,
     /// The View tab: track uri the catalog was fetched for.
@@ -173,6 +210,10 @@ pub struct App {
     pub(crate) view_tracks: Vec<Track>,
     pub(crate) view_cursor: usize,
     pub(crate) view_lyrics: Option<crate::library::Lyrics>,
+    /// Whether lyrics are loading, absent, or in `view_lyrics`.
+    pub(crate) lyrics_state: LyricsState,
+    /// A failed View fetch: track uri and when, to back off before retrying.
+    view_failed: Option<(String, Instant)>,
     /// The seed of the last radio fetch; repeating the same seed means the
     /// radio service had nothing new, so do not loop.
     pub(crate) radio_seed: Option<String>,
@@ -216,16 +257,23 @@ impl App {
             source: Source::Remote,
             local: None,
             pending_local_start: None,
-            local_playlist_play: false,
+            local_playlist_play: None,
+            local_starting: false,
+            local_shuffle: false,
+            search_seq: 0,
+            last_devices_at: Instant::now(),
             picker,
             cover: None,
             cover_request: None,
+            cover_accent: None,
             zones: MouseZones::default(),
             view_for: None,
             view_heading: String::new(),
             view_tracks: Vec::new(),
             view_cursor: 0,
             view_lyrics: None,
+            lyrics_state: LyricsState::Loading,
+            view_failed: None,
             radio_seed: None,
             status: None,
             pending: 0,
@@ -308,6 +356,13 @@ impl App {
                 last_poll = Instant::now();
             }
 
+            if self.source == Source::Remote
+                && !self.has_active_device()
+                && self.last_devices_at.elapsed() >= DEVICE_REFRESH
+            {
+                self.refresh_devices(&jobs);
+            }
+
             if self.status.as_ref().is_some_and(|(_, expires)| Instant::now() >= *expires) {
                 self.status = None;
                 dirty = true;
@@ -384,6 +439,7 @@ impl App {
 
     fn refresh_devices(&mut self, jobs: &Jobs) {
         self.pending += 1;
+        self.last_devices_at = Instant::now();
         let client = jobs.client.clone();
         jobs.submit(
             async move { client.devices().await.map_err(anyhow::Error::from) },
@@ -400,6 +456,9 @@ impl App {
     fn load_tracks(&mut self, jobs: &Jobs, key: &str) {
         self.pending += 1;
         self.tracks_key = Some(key.to_string());
+        // Never show the previous list under the new title.
+        self.tracks.clear();
+        self.tracks_cursor = 0;
         let client = jobs.client.clone();
         let local = jobs.local.clone();
         let key = key.to_string();
@@ -439,6 +498,8 @@ impl App {
             return;
         }
         self.pending += 1;
+        self.search_seq += 1;
+        let seq = self.search_seq;
         let client = jobs.client.clone();
         let local = jobs.local.clone();
         jobs.submit(
@@ -455,8 +516,8 @@ impl App {
                         .map_err(anyhow::Error::from),
                 }
             },
-            |result| match result {
-                Ok(tracks) => AppEvent::SearchResults(tracks),
+            move |result| match result {
+                Ok(tracks) => AppEvent::SearchResults { seq, tracks },
                 Err(e) => AppEvent::Done {
                     action: "search",
                     outcome: Err(e),
@@ -468,7 +529,10 @@ impl App {
     // --- Keys ------------------------------------------------------------------
 
     fn on_key(&mut self, key: KeyEvent, jobs: &Jobs) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // AltGr arrives as CONTROL|ALT on Windows and types a character.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
             if key.code == KeyCode::Char('c') {
                 self.should_quit = true;
             }
@@ -541,8 +605,12 @@ impl App {
                     local.pause();
                 }
                 self.source = Source::Remote;
+                // Drop the local snapshot; the remote poll refills it.
+                self.playback = None;
+                self.playback_at = None;
                 self.say("Output: Spotify devices");
                 self.refresh_playback(jobs);
+                self.refresh_devices(jobs);
             }
             Source::Remote => {
                 self.source = Source::Local;
@@ -595,12 +663,13 @@ impl App {
         let track = snapshot.track.clone();
         let duration_ms = track.duration_ms;
         let playing = snapshot.is_playing;
+        let shuffle = self.local_shuffle;
         let playback = self.playback.get_or_insert_with(Playback::default);
         playback.track = Some(track);
         playback.is_playing = playing;
         playback.progress_ms = snapshot.position_ms;
         playback.duration_ms = duration_ms;
-        playback.shuffle = false;
+        playback.shuffle = shuffle;
         playback.repeat = "off".to_string();
         playback.volume_percent = Some(snapshot.volume_percent);
         playback.device_name = "This terminal (local)".to_string();
@@ -611,9 +680,10 @@ impl App {
     /// in flight. The fetch runs whenever the track changes.
     fn ensure_cover(&mut self, jobs: &Jobs) {
         let Some(track) = self.playback.as_ref().and_then(|p| p.track.as_ref()) else {
-            if self.cover.is_some() {
+            if self.cover.is_some() || self.cover_accent.is_some() {
                 self.cover = None;
                 self.cover_request = None;
+                self.cover_accent = None;
             }
             return;
         };
@@ -627,6 +697,7 @@ impl App {
             return;
         }
         self.cover = None;
+        self.cover_accent = None;
         let Some(url) = track.cover_url.clone() else {
             return;
         };
@@ -637,17 +708,19 @@ impl App {
             async move {
                 let art = crate::cover::load(url).await?;
                 // Protocol encoding (resize, sixel/kitty/halfblocks) is heavy.
-                let protocol = tokio::task::spawn_blocking(move || {
-                    picker
+                let (protocol, accent) = tokio::task::spawn_blocking(move || {
+                    let accent = crate::cover::accent_color(&art.image);
+                    let protocol = picker
                         .new_protocol(
                             art.image.clone(),
                             ratatui::layout::Size::new(COVER_CELLS.0, COVER_CELLS.1),
                             ratatui_image::Resize::Fit(None),
                         )
-                        .ok()
+                        .ok();
+                    (protocol, accent)
                 })
                 .await?;
-                Ok(AppEvent::Cover { uri, protocol })
+                Ok(AppEvent::Cover { uri, protocol, accent })
             },
             |result| match result {
                 Ok(event) => event,
@@ -702,17 +775,33 @@ impl App {
         if self.view_for.as_deref() == Some(uri.as_str()) {
             return;
         }
-        self.view_for = Some(uri.clone());
-        self.view_tracks.clear();
-        self.view_lyrics = None;
-        self.view_cursor = 0;
-        self.view_heading = "Loading".to_string();
+        if let Some((failed, at)) = self.view_failed.as_ref() {
+            if failed == &uri && at.elapsed() < VIEW_RETRY {
+                return;
+            }
+        }
+        // Only the built-in session can read the catalog; without it, stay
+        // retryable (view_for is not set) and say why nothing loads.
         let Some(local) = self.local.as_ref() else {
+            self.view_for = None;
+            self.view_tracks.clear();
+            self.view_lyrics = None;
+            self.lyrics_state = LyricsState::Missing;
+            self.view_heading = "Needs the built-in player (press t)".to_string();
             return;
         };
+        self.view_for = Some(uri.clone());
+        self.view_failed = None;
+        self.view_tracks.clear();
+        self.view_lyrics = None;
+        self.lyrics_state = LyricsState::Loading;
+        self.view_cursor = 0;
+        self.view_heading = "Loading".to_string();
         let session = local.session();
         let seed = uri.clone();
-        self.pending += 1;
+        let failed_uri = uri.clone();
+        let failed_uri2 = uri.clone();
+        self.pending += 2;
         jobs.submit(
             async move {
                 crate::library::view_catalog(&session, &seed)
@@ -723,12 +812,9 @@ impl App {
                         tracks,
                     })
             },
-            |result| match result {
+            move |result| match result {
                 Ok(event) => event,
-                Err(_) => AppEvent::Done {
-                    action: "artist view",
-                    outcome: Ok(()),
-                },
+                Err(_) => AppEvent::ViewFailed { for_track: failed_uri, catalog: true },
             },
         );
         let seed = uri;
@@ -742,21 +828,19 @@ impl App {
                         lyrics,
                     })
             },
-            |result| match result {
+            move |result| match result {
                 Ok(event) => event,
-                Err(_) => AppEvent::Done {
-                    action: "lyrics",
-                    outcome: Ok(()),
-                },
+                Err(_) => AppEvent::ViewFailed { for_track: failed_uri2, catalog: false },
             },
         );
     }
 
     /// Spin up the built-in player in the background, once.
     fn ensure_local_player(&mut self, jobs: &Jobs) {
-        if self.local.is_some() || self.source != Source::Local {
+        if self.local.is_some() || self.local_starting || self.source != Source::Local {
             return;
         }
+        self.local_starting = true;
         self.pending += 1;
         jobs.submit(
             async move {
@@ -796,8 +880,7 @@ impl App {
     fn on_key_search(&mut self, key: KeyEvent, jobs: &Jobs) {
         match key.code {
             KeyCode::Char('q') if self.search_input.is_empty() => self.should_quit = true,
-            KeyCode::Tab => self.tab = Tab::Library,
-            KeyCode::Char('v') => self.tab = Tab::View,
+            KeyCode::Tab => self.tab = Tab::View,
             KeyCode::Esc => {
                 self.search_input.clear();
                 self.search_cursor = 0;
@@ -827,7 +910,8 @@ impl App {
                 if self.tracks_focused {
                     (&mut self.tracks_cursor, self.tracks.len())
                 } else {
-                    (&mut self.playlists_cursor, self.playlists.len())
+                    // Row 0 is Liked Songs, rows 1.. are the playlists.
+                    (&mut self.playlists_cursor, self.playlists.len() + 1)
                 }
             }
             Tab::Search => (&mut self.search_cursor, self.search_results.len()),
@@ -851,21 +935,25 @@ impl App {
     fn play_selection(&mut self, jobs: &Jobs) {
         match self.tab {
             Tab::Library if !self.tracks_focused => {
-                let Some(playlist) = self.playlists.get(self.playlists_cursor) else {
-                    return;
+                // Row 0 is Liked Songs, rows 1.. are playlists[row - 1].
+                let (id, name, uri) = if self.playlists_cursor == 0 {
+                    (LIKED_KEY.to_string(), "Liked Songs".to_string(), None)
+                } else {
+                    let Some(playlist) = self.playlists.get(self.playlists_cursor - 1) else {
+                        return;
+                    };
+                    (playlist.id.clone(), playlist.name.clone(), Some(playlist.uri.clone()))
                 };
-                let name = playlist.name.clone();
-                let uri = playlist.uri.clone();
-                let id = playlist.id.clone();
                 let jobs = jobs.clone();
                 self.tracks_focused = true;
                 self.tracks_cursor = 0;
+                self.local_playlist_play = None;
                 self.load_tracks(&jobs, &id);
                 match self.source {
                     Source::Local => {
                         // The track list arrives as an event; opening plays
                         // its first track through the built-in player then.
-                        self.local_playlist_play = true;
+                        self.local_playlist_play = Some(id);
                         if self.local.is_none() {
                             self.say(format!("Opening {name}; starting the local player..."));
                             self.ensure_local_player(&jobs);
@@ -874,18 +962,24 @@ impl App {
                         }
                     }
                     Source::Remote if !self.has_active_device() => {
+                        self.refresh_devices(&jobs);
                         self.say("No Spotify device found; press t to stream locally, or open the Spotify app");
                     }
-                    Source::Remote => {
-                        self.say(format!("Opening {name}..."));
-                        let client = jobs.client.clone();
-                        jobs.submit(
-                            async move {
-                                client.play_context(None, &uri, None).await.map_err(anyhow::Error::from)
-                            },
-                            done("play playlist"),
-                        );
-                    }
+                    Source::Remote => match uri {
+                        Some(uri) => {
+                            self.say(format!("Opening {name}..."));
+                            let client = jobs.client.clone();
+                            jobs.submit(
+                                async move {
+                                    client.play_context(None, &uri, None).await.map_err(anyhow::Error::from)
+                                },
+                                done("play playlist"),
+                            );
+                        }
+                        // Liked Songs has no context uri: just show the list;
+                        // Enter on a track plays it.
+                        None => self.say("Opening Liked Songs..."),
+                    },
                 }
             }
             _ => {
@@ -893,6 +987,11 @@ impl App {
                     return;
                 };
                 let uri = track.uri.clone();
+                if self.source == Source::Remote && !self.has_active_device() {
+                    self.refresh_devices(jobs);
+                    self.say("No Spotify device found; press t to stream locally, or open the Spotify app");
+                    return;
+                }
                 self.set_playing_track(&track);
                 match self.source {
                     Source::Local => {
@@ -907,9 +1006,6 @@ impl App {
                                 self.ensure_local_player(jobs);
                             }
                         }
-                    }
-                    Source::Remote if !self.has_active_device() => {
-                        self.say("No Spotify device found; press t to stream locally, or open the Spotify app");
                     }
                     _ => {
                         let client = jobs.client.clone();
@@ -1013,9 +1109,14 @@ impl App {
     fn toggle_shuffle(&mut self, jobs: &Jobs) {
         if self.source == Source::Local {
             if let Some(local) = self.local.as_ref() {
-                local.shuffle_queue();
+                // Turning it on shuffles what is still queued; turning it
+                // off only clears the flag (the queue is not restored).
+                self.local_shuffle = !self.local_shuffle;
+                if self.local_shuffle {
+                    local.shuffle_queue();
+                }
                 self.apply_local_snapshot();
-                let on = self.playback.as_ref().is_some_and(|p| p.shuffle);
+                let on = self.local_shuffle;
                 self.say(if on { "Shuffle on" } else { "Shuffle off" });
             }
             return;
@@ -1103,7 +1204,8 @@ impl App {
             return;
         }
         if self.devices.len() < 2 {
-            self.say("No other Spotify Connect device found");
+            self.refresh_devices(jobs);
+            self.say("No other Spotify Connect device found; rescanning");
             return;
         }
         self.device_index = (self.device_index + 1) % self.devices.len();
@@ -1125,58 +1227,57 @@ impl App {
             MouseEventKind::ScrollUp => self.move_cursor(-1),
             MouseEventKind::ScrollDown => self.move_cursor(1),
             MouseEventKind::Down(MouseButton::Left) => {
-                let row = mouse.row;
-                let column = mouse.column;
-                if self.zones.playlists .contains(ratatui::layout::Position { x: column, y: row }) {
-                    self.tracks_focused = false;
-                    let index = row - self.zones.playlists.y;
-                    if index as usize > self.playlists.len() { return; }
-                    if index == 0 {
-                        // Liked Songs, row 0 in the list.
-                        self.tracks_focused = true;
-                        self.load_tracks(jobs, LIKED_KEY);
-                        self.say("Opening Liked Songs...");
-                        return;
-                    }
-                    self.playlists_cursor = index as usize - 1;
-                    self.play_selection(jobs);
-                    return;
-                }
-                if self.zones.tracks .contains(ratatui::layout::Position { x: column, y: row }) {
-                    let index = (row - self.zones.tracks.y + self.zones.tracks_leading_rows) as usize;
-                    if index >= self.tracks.len() { return; }
-                    self.tracks_focused = true;
-                    self.tab = Tab::Library;
-                    self.tracks_cursor = index;
-                    self.play_selection(jobs);
-                    return;
-                }
-                if self.zones.results .contains(ratatui::layout::Position { x: column, y: row }) {
-                    self.tab = Tab::Search;
-                    let index = (row - self.zones.results.y) as usize;
-                    if index >= self.search_results.len() { return; }
-                    self.search_cursor = index;
-                    if matches!(self.source, Source::Local) {
-                        if let Some(local) = self.local.clone() {
-                            self.set_playing_track(self.selected_track().as_ref().unwrap());
-                            let mut queue = self.search_results.clone();
-                            let head: Vec<Track> = queue.drain(..index).collect();
-                            queue.extend(head);
-                            self.start_local(&local, queue,0);
-                        } else {
-                            self.pending_local_start = Some((self.search_results.clone(), index));
+                use ratatui::layout::Position;
+                let at = Position { x: mouse.column, y: mouse.row };
+                let row_in = |zone: ratatui::layout::Rect, offset: usize| -> usize {
+                    (mouse.row - zone.y) as usize + offset
+                };
+                match self.tab {
+                    Tab::Library => {
+                        if self.zones.playlists.contains(at) {
+                            // Row 0 is Liked Songs, rows 1.. the playlists.
+                            let index = row_in(self.zones.playlists, self.zones.playlists_offset);
+                            if index > self.playlists.len() {
+                                return;
+                            }
+                            self.tracks_focused = false;
+                            self.playlists_cursor = index;
+                            self.play_selection(jobs);
+                        } else if self.zones.tracks.contains(at) {
+                            let leading = self.zones.tracks_leading_rows as usize;
+                            let rel = (mouse.row - self.zones.tracks.y) as usize;
+                            if rel < leading {
+                                return;
+                            }
+                            let index = rel - leading + self.zones.tracks_offset;
+                            if index >= self.tracks.len() {
+                                return;
+                            }
+                            self.tracks_focused = true;
+                            self.tracks_cursor = index;
+                            self.play_selection(jobs);
                         }
-                        return;
                     }
-                    self.play_selection(jobs);
-                    return;
-                }
-                if self.zones.view .contains(ratatui::layout::Position { x: column, y: row }) {
-                    self.tab = Tab::View;
-                    let index = (row - self.zones.view.y) as usize;
-                    if index >= self.view_tracks.len() { return; }
-                    self.view_cursor = index;
-                    self.play_view_selection();
+                    Tab::Search => {
+                        if self.zones.results.contains(at) {
+                            let index = row_in(self.zones.results, self.zones.results_offset);
+                            if index >= self.search_results.len() {
+                                return;
+                            }
+                            self.search_cursor = index;
+                            self.play_selection(jobs);
+                        }
+                    }
+                    Tab::View => {
+                        if self.zones.view.contains(at) {
+                            let index = row_in(self.zones.view, self.zones.view_offset);
+                            if index >= self.view_tracks.len() {
+                                return;
+                            }
+                            self.view_cursor = index;
+                            self.play_view_selection();
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1191,11 +1292,18 @@ impl App {
                 self.playback_in_flight = false;
                 self.pending = self.pending.saturating_sub(1);
                 match result {
+                    // A late reply must not overwrite the local snapshot.
+                    Ok(_) if self.source == Source::Local => {}
                     Ok(Some(playback)) => {
                         self.playback_at = Some(Instant::now());
                         self.playback = Some(playback);
                     }
-                    Ok(None) => {}
+                    // Nothing is playing anywhere: stop extrapolating.
+                    Ok(None) => {
+                        if let Some(playback) = self.playback.as_mut() {
+                            playback.is_playing = false;
+                        }
+                    }
                     Err(e) => self.say(format!("Playback: {e}")),
                 }
             }
@@ -1211,8 +1319,11 @@ impl App {
                 if self.tracks_key.as_deref() == Some(key.as_str()) {
                     self.tracks = tracks;
                     self.tracks_cursor = self.tracks_cursor.min(self.tracks.len().saturating_sub(1));
-                    if self.local_playlist_play && self.source == Source::Local && !self.tracks.is_empty() {
-                        self.local_playlist_play = false;
+                    if self.local_playlist_play.as_deref() == Some(key.as_str())
+                        && self.source == Source::Local
+                        && !self.tracks.is_empty()
+                    {
+                        self.local_playlist_play = None;
                         let tracks = self.tracks.clone();
                         match self.local.clone() {
                             Some(local) => self.start_local(&local, tracks, 0),
@@ -1221,8 +1332,11 @@ impl App {
                     }
                 }
             }
-            AppEvent::SearchResults(tracks) => {
+            AppEvent::SearchResults { seq, tracks } => {
                 self.pending = self.pending.saturating_sub(1);
+                if seq != self.search_seq {
+                    return;
+                }
                 let count = tracks.len();
                 self.search_results = tracks;
                 self.search_cursor = 0;
@@ -1235,12 +1349,29 @@ impl App {
             AppEvent::Done { action, outcome } => {
                 self.pending = self.pending.saturating_sub(1);
                 if let Err(e) = outcome {
-                    self.say_error(format!("{action}: {e}"));
+                    if action == "load tracks" {
+                        self.local_playlist_play = None;
+                    }
+                    let text = format!("{e}");
+                    let lower = text.to_ascii_lowercase();
+                    let no_device = lower.contains("no active device")
+                        || lower.contains("no_active_device")
+                        || lower.contains("404");
+                    if no_device && self.source == Source::Remote {
+                        self.refresh_devices(jobs);
+                    }
+                    // Device rescans run in the background; stay quiet.
+                    if action != "devices" {
+                        self.say_error(format!("{action}: {text}"));
+                    }
                 }
             }
             AppEvent::PlayerReady(result) => {
                 self.pending = self.pending.saturating_sub(1);
+                self.local_starting = false;
                 match result {
+                    // A duplicate session: keep the first, drop this one.
+                    Ok(extra) if self.local.is_some() => extra.shutdown(),
                     Ok(local) => {
                         // Forward player state changes into the event queue.
                         let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1269,7 +1400,7 @@ impl App {
                     }
                 }
             }
-            AppEvent::Cover { uri, protocol } => {
+            AppEvent::Cover { uri, protocol, accent } => {
                 self.pending = self.pending.saturating_sub(1);
                 self.cover_request = None;
                 if self
@@ -1281,6 +1412,7 @@ impl App {
                     if let Some(protocol) = protocol {
                         self.cover = Some((uri, protocol));
                     }
+                    self.cover_accent = accent.map(|(r, g, b)| ratatui::style::Color::Rgb(r, g, b));
                 }
             }
             AppEvent::LocalSignal(signal) => match signal {
@@ -1306,6 +1438,7 @@ impl App {
                 }
             }
             AppEvent::ViewCatalog { for_track, artist, tracks } => {
+                self.pending = self.pending.saturating_sub(1);
                 if self.view_for.as_deref() == Some(for_track.as_str()) {
                     self.view_heading = format!("{artist} — top tracks");
                     self.view_tracks = tracks;
@@ -1313,10 +1446,26 @@ impl App {
                 }
             }
             AppEvent::ViewLyrics { for_track, lyrics } => {
+                self.pending = self.pending.saturating_sub(1);
                 if self.view_for.as_deref() == Some(for_track.as_str()) {
+                    self.lyrics_state =
+                        if lyrics.is_some() { LyricsState::Ready } else { LyricsState::Missing };
                     self.view_lyrics = lyrics;
                 }
-            },
+            }
+            AppEvent::ViewFailed { for_track, catalog } => {
+                self.pending = self.pending.saturating_sub(1);
+                if self.view_for.as_deref() == Some(for_track.as_str()) {
+                    if catalog {
+                        // Allow a retry after the backoff.
+                        self.view_for = None;
+                        self.view_failed = Some((for_track, Instant::now()));
+                        self.view_heading = "Couldn't load; retrying...".to_string();
+                    } else {
+                        self.lyrics_state = LyricsState::Missing;
+                    }
+                }
+            }
         }
     }
 }
