@@ -212,6 +212,9 @@ fn empty_state(frame: &mut Frame, theme: &Theme, area: Rect, glyph: &str, msg: &
     );
 }
 
+/// Builds the three text columns of a result row from its index.
+type RowFn<'a> = Box<dyn Fn(usize) -> (String, String, String) + 'a>;
+
 fn draw_scrollbar(frame: &mut Frame, theme: &Theme, items: Rect, len: usize, offset: usize) {
     let height = items.height as usize;
     if len <= height || items.height == 0 {
@@ -633,7 +636,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect, prev
                 (Rect::default(), 0)
             } else {
                 let cursor = app.search_cursor_of(category);
-                let (heads, row): ([&str; 3], Box<dyn Fn(usize) -> (String, String, String) + '_>) = match category {
+                let (heads, row): ([&str; 3], RowFn<'_>) = match category {
                     SearchCategory::Artists => (
                         ["NAME", "", "FOLLOWERS"],
                         Box::new(|i| {

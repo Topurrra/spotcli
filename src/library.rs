@@ -184,7 +184,7 @@ pub async fn album_tracks(
 /// Resolve spclient track metadata for `uris`, in order, skipping entries
 /// that fail (unavailable region-locked or removed tracks).
 async fn resolve(session: &Session, uris: Vec<String>) -> Vec<Track> {
-    stream::iter(uris.into_iter())
+    stream::iter(uris)
         .map(|uri| {
         let session = session.clone();
         async move {

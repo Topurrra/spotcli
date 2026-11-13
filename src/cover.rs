@@ -128,7 +128,7 @@ pub fn accent_color(img: &image::DynamicImage) -> Option<(u8, u8, u8)> {
         .filter(|b| b.0 > 0)
         .max_by(|a, b| {
             let score = |b: &&(u32, f32, f32, f32)| b.0 as f32 * (b.1 / b.0 as f32);
-            score(&a).total_cmp(&score(&b))
+            score(a).total_cmp(&score(b))
         })?;
     // Ignore a handful of stray pixels (under ~2% of the 576).
     if count < 12 {
