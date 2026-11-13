@@ -32,7 +32,7 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin, label: aarch64-macos }
           - { os: macos-latest, target: x86_64-apple-darwin, label: x86_64-macos }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
@@ -45,6 +45,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - name: Build
+        # crt-static: the exe must not need the Visual C++ runtime installed.
+        env:
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (Windows)

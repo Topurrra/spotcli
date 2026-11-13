@@ -1,0 +1,4 @@
+# Bake the C runtime into Windows MSVC builds so spotcli.exe runs on PCs
+# without the Visual C++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
