@@ -15,6 +15,7 @@ use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, Key
 use tokio::runtime::Handle;
 
 use crate::api::Client;
+use crate::player::LocalPlayer;
 use crate::theme::Theme;
 use crate::models::{Device, Playback, Playlist, Track};
 
@@ -37,6 +38,32 @@ pub const LIKED_KEY: &str = "liked";
 pub enum Tab {
     Library,
     Search,
+    /// What is playing: the artist's top tracks and synced lyrics.
+    View,
+}
+
+/// Where the list panes rendered last frame: click targets for the mouse.
+#[derive(Clone, Copy, Default)]
+pub struct MouseZones {
+    /// The playlist list items, row 0 being the built-in liked list.
+    pub playlists: ratatui::layout::Rect,
+    /// The (library or view) track list items minus its heading rows.
+    pub tracks: ratatui::layout::Rect,
+    /// The search result list items.
+    pub results: ratatui::layout::Rect,
+    /// The view tab artist-track list items.
+    pub view: ratatui::layout::Rect,
+    /// Rows the playlist/tracks list skips before the first entry.
+    pub tracks_leading_rows: u16,
+}
+
+/// Where audio comes from: another Spotify device, driven over the Web API,
+/// or spotcli itself streaming through the built-in player.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum Source {
+    #[default]
+    Remote,
+    Local,
 }
 
 /// A message from a background task.
@@ -47,16 +74,40 @@ pub enum AppEvent {
     SearchResults(Vec<Track>),
     Devices(Vec<Device>),
     Done { action: &'static str, outcome: Result<()> },
+    /// The built-in player finished starting up.
+    PlayerReady(Result<LocalPlayer>),
+    /// A state change in the built-in player.
+    LocalSignal(crate::player::LocalSignal),
+    /// Album art for `uri` finished rendering.
+    Cover {
+        uri: String,
+        art: std::sync::Arc<crate::cover::CoverArt>,
+    },
+    /// Radio continuation tracks for a seed.
+    RadioTracks { tracks: Vec<Track> },
+    /// Artist top tracks (View tab) fetched for a track.
+    ViewCatalog {
+        for_track: String,
+        artist: String,
+        tracks: Vec<Track>,
+    },
+    /// Synced lyrics (View tab) fetched for a track.
+    ViewLyrics {
+        for_track: String,
+        lyrics: Option<crate::library::Lyrics>,
+    },
 }
 
 type EventTx = mpsc::Sender<AppEvent>;
 
-/// Submits background jobs against the API client.
+/// Submits background jobs against the API client, or against the streaming
+/// session for reads the Web API refuses to development-mode apps.
 #[derive(Clone)]
 struct Jobs {
     client: Client,
     handle: Handle,
     tx: EventTx,
+    local: Option<LocalPlayer>,
 }
 
 impl Jobs {
@@ -93,8 +144,34 @@ pub struct App {
     pub(crate) devices: Vec<Device>,
     pub(crate) device_index: usize,
 
-    pub(crate) status: Option<(String, Instant)>,
-    pub(crate) pending: usize,
+    pub(crate) source: Source,
+    /// The built-in streaming player once it has connected.
+    pub(crate) local: Option<LocalPlayer>,
+    /// Playback to begin the moment the built-in player is ready: a
+    /// selected track with the list it came from.
+    pub(crate) pending_local_start: Option<(Vec<Track>, usize)>,
+    /// A playlist was opened locally; play its first track once loaded.
+    pub(crate) local_playlist_play: bool,
+
+    /// Terminal capability picker (kitty/sixel/halfblocks) from startup.
+    pub(crate) picker: ratatui_image::picker::Picker,
+    /// The now-playing cover rendered for the terminal: the track uri.
+    pub(crate) cover: Option<(String, ratatui_image::protocol::Protocol)>,
+    /// The track uri whose cover fetch is in flight.
+    pub(crate) cover_request: Option<String>,
+
+    pub(crate) zones: MouseZones,
+    /// The View tab: track uri the catalog was fetched for.
+    pub(crate) view_for: Option<String>,
+    pub(crate) view_heading: String,
+    pub(crate) view_tracks: Vec<Track>,
+    pub(crate) view_cursor: usize,
+    pub(crate) view_lyrics: Option<crate::library::Lyrics>,
+    /// The seed of the last radio fetch; repeating the same seed means the
+    /// radio service had nothing new, so do not loop.
+    pub(crate) radio_seed: Option<String>,
+
+    pub(crate) status: Option<(String, Instant)>,    pub(crate) pending: usize,
 }
 
 impl Default for App {
@@ -105,11 +182,11 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        Self::with_theme(Theme::dark())
+        Self::with_theme(Theme::dark(), ratatui_image::picker::Picker::halfblocks())
     }
 
-    /// Build the app with an explicit palette.
-    pub fn with_theme(theme: Theme) -> Self {
+    /// Build the app with an explicit palette and image protocol picker.
+    pub fn with_theme(theme: Theme, picker: ratatui_image::picker::Picker) -> Self {
         Self {
             tab: Tab::Library,
             should_quit: false,
@@ -127,6 +204,20 @@ impl App {
             playback_at: None,
             devices: Vec::new(),
             device_index: 0,
+            source: Source::Remote,
+            local: None,
+            pending_local_start: None,
+            local_playlist_play: false,
+            picker,
+            cover: None,
+            cover_request: None,
+            zones: MouseZones::default(),
+            view_for: None,
+            view_heading: String::new(),
+            view_tracks: Vec::new(),
+            view_cursor: 0,
+            view_lyrics: None,
+            radio_seed: None,
             status: None,
             pending: 0,
         }
@@ -140,11 +231,15 @@ impl App {
         handle: Handle,
     ) -> Result<()> {
         let (tx, rx) = mpsc::channel::<AppEvent>();
-        let jobs = Jobs { client, handle, tx };
+        let mut jobs = Jobs { client, handle, tx, local: None };
         self.bootstrap(&jobs);
 
         let mut last_poll = Instant::now();
         while !self.should_quit {
+            if self.source == Source::Local {
+                // The built-in player advances its own state; show it live.
+                self.apply_local_snapshot();
+            }
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
 
             if event::poll(TICK)? {
@@ -160,25 +255,58 @@ impl App {
             }
 
             while let Ok(event) = rx.try_recv() {
-                self.on_event(event);
+                self.on_event(event, &jobs);
+                if jobs.local.is_none() {
+                    jobs.local = self.local.clone();
+                }
             }
 
-            if last_poll.elapsed() >= PLAYBACK_POLL {
+            self.ensure_cover(&jobs);
+            if self.tab == Tab::View {
+                self.refresh_view(&jobs);
+            }
+
+            if self.source == Source::Remote && last_poll.elapsed() >= PLAYBACK_POLL {
                 self.refresh_playback(&jobs);
                 last_poll = Instant::now();
             }
+        }
+        if let Some(local) = self.local.as_ref() {
+            local.shutdown();
         }
         Ok(())
     }
 
     fn bootstrap(&mut self, jobs: &Jobs) {
         self.refresh_playlists(jobs);
-        self.refresh_playback(jobs);
         self.refresh_devices(jobs);
+        // Songs visible without a second click: liked tracks load on start.
+        self.load_tracks(jobs, LIKED_KEY);
+        self.tracks_focused = true;
+        // When the streaming grant exists, this terminal is the default
+        // speaker; the Web API device list stays under `t`.
+        if let Ok(dir) = crate::config_dir() {
+            if dir.join("streaming").join("credentials.json").exists() {
+                self.source = Source::Local;
+                self.ensure_local_player(jobs);
+            }
+        }
+    }
+
+    /// Any Spotify device that could take playback right now.
+    fn has_active_device(&self) -> bool {
+        self.devices.iter().any(|device| device.is_active)
     }
 
     fn say(&mut self, message: impl Into<String>) {
-        self.status = Some((message.into(), Instant::now()));
+        self.status = Some((message.into(), Instant::now() + STATUS_TTL));
+    }
+
+    /// Like `say`, but the message stays on screen until the next action.
+    /// Errors are easy to miss in four seconds.
+    fn say_error(&mut self, message: impl Into<String>) {
+        self.status =
+            Some((message.into(), Instant::now() + Duration::from_secs(10 * 60)));
     }
 
     // --- Background refreshes -------------------------------------------------
@@ -214,17 +342,27 @@ impl App {
         self.pending += 1;
         self.tracks_key = Some(key.to_string());
         let client = jobs.client.clone();
+        let local = jobs.local.clone();
         let key = key.to_string();
         jobs.submit(
             async move {
-                let tracks = if key == LIKED_KEY {
-                    client.saved_tracks(LIBRARY_LIMIT).await
-                } else {
-                    client.playlist_tracks(&key, LIBRARY_LIMIT).await
+                let tracks = match (key.as_str(), local.as_ref()) {
+                    (LIKED_KEY, _) => client
+                        .saved_tracks(LIBRARY_LIMIT)
+                        .await
+                        .map_err(anyhow::Error::from),
+                    (_, Some(local)) => {
+                        crate::library::playlist_tracks(&local.session(), &key, LIBRARY_LIMIT as usize).await
+                    }
+                    // Without the streaming session the Web API serves
+                    // playlist contents only when the app has extended
+                    // quota; otherwise Spotify answers 403 Forbidden.
+                    (_, None) => client
+                        .playlist_tracks(&key, LIBRARY_LIMIT)
+                        .await
+                        .map_err(anyhow::Error::from),
                 };
-                tracks
-                    .map(|tracks| (key, tracks))
-                    .map_err(anyhow::Error::from)
+                tracks.map(|tracks| (key, tracks))
             },
             |result| match result {
                 Ok((key, tracks)) => AppEvent::Tracks { key, tracks },
@@ -243,8 +381,21 @@ impl App {
         }
         self.pending += 1;
         let client = jobs.client.clone();
+        let local = jobs.local.clone();
         jobs.submit(
-            async move { client.search_tracks(&query, SEARCH_LIMIT).await.map_err(anyhow::Error::from) },
+            async move {
+                // The session search has no per-app quota; the Web API's
+                // shared search endpoint answers 503 under load.
+                match local.as_ref() {
+                    Some(local) => {
+                        crate::library::search(&local.session(), &query, SEARCH_LIMIT as usize).await
+                    }
+                    None => client
+                        .search_tracks(&query, SEARCH_LIMIT)
+                        .await
+                        .map_err(anyhow::Error::from),
+                }
+            },
             |result| match result {
                 Ok(tracks) => AppEvent::SearchResults(tracks),
                 Err(e) => AppEvent::Done {
@@ -264,21 +415,299 @@ impl App {
             }
             return;
         }
+        // Media keys the terminal forwards (Windows media keys pass through
+        // in recent terminals; elsewhere they simply do nothing).
+        if let KeyCode::Media(media) = key.code {
+            use ratatui::crossterm::event::MediaKeyCode;
+            match media {
+                MediaKeyCode::Play | MediaKeyCode::PlayPause => self.toggle_playback(jobs),
+                MediaKeyCode::TrackNext | MediaKeyCode::FastForward => self.skip(jobs, true),
+                MediaKeyCode::TrackPrevious | MediaKeyCode::Rewind => self.skip(jobs, false),
+                _ => {}
+            }
+            return;
+        }
         match self.tab {
             Tab::Library => self.on_key_library(key, jobs),
             Tab::Search => self.on_key_search(key, jobs),
+            Tab::View => self.on_key_view(key, jobs),
         }
+    }
+
+    fn on_key_view(&mut self, key: KeyEvent, jobs: &Jobs) {
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Tab => self.tab = Tab::Library,
+            KeyCode::Char('v') => self.tab = Tab::Library,
+            KeyCode::Esc => self.tab = Tab::Library,
+            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
+            KeyCode::Enter => self.play_view_selection(),
+            KeyCode::Char(' ') => self.toggle_playback(jobs),
+            KeyCode::Char('n') => self.skip(jobs, true),
+            KeyCode::Char('p') => self.skip(jobs, false),
+            KeyCode::Char(',') => self.seek(jobs, -5000),
+            KeyCode::Char('.') => self.seek(jobs, 5000),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.change_volume(jobs, 5),
+            KeyCode::Char('-') => self.change_volume(jobs, -5),
+            _ => {}
+        }
+    }
+
+    /// Play the View-tab selection through the built-in player.
+    fn play_view_selection(&mut self) {
+        let Some(track) = self.view_tracks.get(self.view_cursor).cloned() else {
+            return;
+        };
+        if matches!(self.source, Source::Local) {
+            if let Some(local) = self.local.clone() {
+                self.set_playing_track(&track);
+                let mut queue = self.view_tracks.clone();
+                // The selection becomes the queue start: everything before
+                // the cursor rotates to the end, standard players do this.
+                let head: Vec<Track> = queue.drain(..self.view_cursor).collect();
+                queue.extend(head);
+                self.start_local(&local, queue, 0);
+                return;
+            }
+        }
+        self.say("Local playback unavailable; press t to switch outputs");
+    }
+
+    /// Switch audio between Spotify devices and spotcli's own speakers.
+    fn toggle_source(&mut self, jobs: &Jobs) {
+        match self.source {
+            Source::Local => {
+                if let Some(local) = self.local.as_ref() {
+                    local.pause();
+                }
+                self.source = Source::Remote;
+                self.say("Output: Spotify devices");
+                self.refresh_playback(jobs);
+            }
+            Source::Remote => {
+                self.source = Source::Local;
+                self.apply_local_snapshot();
+                if let Some(local) = self.local.clone() {
+                    self.say("Output: this terminal");
+                    if let Some((tracks, index)) = self.selection_list() {
+                        self.start_local(&local, tracks, index);
+                    }
+                } else {
+                    // Who is going to stream what, the moment the player is up.
+                    self.pending_local_start = self.selection_list();
+                    self.say("Starting the local player...");
+                    self.ensure_local_player(jobs);
+                }
+            }
+        }
+    }
+
+    /// The currently focused track list with the cursor into it.
+    fn selection_list(&self) -> Option<(Vec<Track>, usize)> {
+        match self.tab {
+            Tab::Library if self.tracks_focused => {
+                Some((self.tracks.clone(), self.tracks_cursor))
+            }
+            Tab::Search => Some((self.search_results.clone(), self.search_cursor)),
+            _ => None,
+        }
+    }
+
+    /// Begin playing `tracks[index]` through the built-in player.
+    fn start_local(&mut self, local: &LocalPlayer, tracks: Vec<Track>, index: usize) {
+        match local.play_queue(tracks, index) {
+            Ok(()) => {
+                self.apply_local_snapshot();
+                self.say("Streaming locally");
+            }
+            Err(e) => self.say(format!("Local player: {e}")),
+        }
+    }
+
+    /// Copy the built-in player's state into the shared playback view.
+    fn apply_local_snapshot(&mut self) {
+        let Some(local) = self.local.as_ref() else {
+            return;
+        };
+        let Some(snapshot) = local.snapshot() else {
+            return;
+        };
+        let track = snapshot.track.clone();
+        let duration_ms = track.duration_ms;
+        let playing = snapshot.is_playing;
+        let playback = self.playback.get_or_insert_with(Playback::default);
+        playback.track = Some(track);
+        playback.is_playing = playing;
+        playback.progress_ms = snapshot.position_ms;
+        playback.duration_ms = duration_ms;
+        playback.shuffle = false;
+        playback.repeat = "off".to_string();
+        playback.volume_percent = Some(snapshot.volume_percent);
+        playback.device_name = "This terminal (local)".to_string();
+        self.playback_at = snapshot.progress_at;
+    }
+
+    /// Fetch the cover of the playing track, unless it is already shown or
+    /// in flight. The fetch runs whenever the track changes.
+    fn ensure_cover(&mut self, jobs: &Jobs) {
+        let Some(track) = self.playback.as_ref().and_then(|p| p.track.as_ref()) else {
+            if self.cover.is_some() {
+                self.cover = None;
+                self.cover_request = None;
+            }
+            return;
+        };
+        let uri = track.uri.clone();
+        if self
+            .cover
+            .as_ref()
+            .is_some_and(|(shown, _)| shown == &uri)
+            || self.cover_request.as_deref() == Some(uri.as_str())
+        {
+            return;
+        }
+        self.cover = None;
+        let Some(url) = track.cover_url.clone() else {
+            return;
+        };
+        self.cover_request = Some(uri.clone());
+        self.pending += 1;
+        jobs.submit(
+            async move {
+                crate::cover::load(url)
+                    .await
+                    .map(|art| AppEvent::Cover { uri, art })
+            },
+            |result| match result {
+                Ok(event) => event,
+                Err(_) => AppEvent::Done {
+                    action: "cover art",
+                    outcome: Ok(()),
+                },
+            },
+        );
+    }
+
+    /// Ask Spotify's radio for what follows the last played track and keep
+    /// going; a no-op when the same seed produced nothing before.
+    fn request_radio(&mut self, jobs: &Jobs) {
+        let Some(local) = self.local.as_ref() else {
+            return;
+        };
+        let Some(track) = local.current() else {
+            return;
+        };
+        let seed = track.uri.clone();
+        if self.radio_seed.as_deref() == Some(seed.as_str()) {
+            self.say("Queue finished");
+            return;
+        }
+        self.radio_seed = Some(seed.clone());
+        let recent = local.played_uris();
+        let session = local.session();
+        jobs.submit(
+            async move {
+                crate::library::radio_tracks(&session, &seed, recent)
+                    .await
+                    .map(|tracks| AppEvent::RadioTracks { tracks })
+            },
+            |result| match result {
+                Ok(event) => event,
+                Err(_) => AppEvent::Done {
+                    action: "radio",
+                    outcome: Ok(()),
+                },
+            },
+        );
+    }
+
+    /// Refresh the View tab for the playing track: artist top tracks and
+    /// synced lyrics, fetched once per track.
+    fn refresh_view(&mut self, jobs: &Jobs) {
+        let Some(track) = self.playback.as_ref().and_then(|p| p.track.as_ref()) else {
+            return;
+        };
+        let uri = track.uri.clone();
+        if self.view_for.as_deref() == Some(uri.as_str()) {
+            return;
+        }
+        self.view_for = Some(uri.clone());
+        self.view_tracks.clear();
+        self.view_lyrics = None;
+        self.view_cursor = 0;
+        self.view_heading = "Loading".to_string();
+        let Some(local) = self.local.as_ref() else {
+            return;
+        };
+        let session = local.session();
+        let seed = uri.clone();
+        self.pending += 1;
+        jobs.submit(
+            async move {
+                crate::library::view_catalog(&session, &seed)
+                    .await
+                    .map(|(artist, tracks)| AppEvent::ViewCatalog {
+                        for_track: seed,
+                        artist,
+                        tracks,
+                    })
+            },
+            |result| match result {
+                Ok(event) => event,
+                Err(_) => AppEvent::Done {
+                    action: "artist view",
+                    outcome: Ok(()),
+                },
+            },
+        );
+        let seed = uri;
+        let session = local.session();
+        jobs.submit(
+            async move {
+                crate::library::lyrics(&session, &seed)
+                    .await
+                    .map(|lyrics| AppEvent::ViewLyrics {
+                        for_track: seed,
+                        lyrics,
+                    })
+            },
+            |result| match result {
+                Ok(event) => event,
+                Err(_) => AppEvent::Done {
+                    action: "lyrics",
+                    outcome: Ok(()),
+                },
+            },
+        );
+    }
+
+    /// Spin up the built-in player in the background, once.
+    fn ensure_local_player(&mut self, jobs: &Jobs) {
+        if self.local.is_some() || self.source != Source::Local {
+            return;
+        }
+        self.pending += 1;
+        jobs.submit(
+            async move {
+                let dir = crate::config_dir()?;
+                LocalPlayer::create(&dir).await
+            },
+            AppEvent::PlayerReady,
+        );
     }
 
     fn on_key_library(&mut self, key: KeyEvent, jobs: &Jobs) {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab => self.tab = Tab::Search,
+            KeyCode::Char('v') => self.tab = Tab::View,
             KeyCode::Left | KeyCode::Char('h') => self.tracks_focused = false,
             KeyCode::Right | KeyCode::Char('l') => self.tracks_focused = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Enter => self.play_selection(jobs),
+            KeyCode::Char('t') => self.toggle_source(jobs),
             KeyCode::Char(' ') => self.toggle_playback(jobs),
             KeyCode::Char('n') => self.skip(jobs, true),
             KeyCode::Char('p') => self.skip(jobs, false),
@@ -286,6 +715,8 @@ impl App {
             KeyCode::Char('r') => self.cycle_repeat(jobs),
             KeyCode::Char('+') | KeyCode::Char('=') => self.change_volume(jobs, 5),
             KeyCode::Char('-') => self.change_volume(jobs, -5),
+            KeyCode::Char(',') => self.seek(jobs, -5000),
+            KeyCode::Char('.') => self.seek(jobs, 5000),
             KeyCode::Char('a') => self.queue_selection(jobs),
             KeyCode::Char('d') => self.next_device(jobs),
             _ => {}
@@ -296,6 +727,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') if self.search_input.is_empty() => self.should_quit = true,
             KeyCode::Tab => self.tab = Tab::Library,
+            KeyCode::Char('v') => self.tab = Tab::View,
             KeyCode::Esc => {
                 self.search_input.clear();
                 self.search_cursor = 0;
@@ -307,9 +739,8 @@ impl App {
             }
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::Down => self.move_cursor(1),
-            KeyCode::Char(' ') => self.toggle_playback(jobs),
-            KeyCode::Char('n') => self.skip(jobs, true),
-            KeyCode::Char('p') => self.skip(jobs, false),
+            // Every printable key goes into the input here; playback keys
+            // live in the Library tab.
             KeyCode::Char(c) => {
                 self.search_input.push(c);
                 self.search_cursor = 0;
@@ -321,6 +752,7 @@ impl App {
     /// Move the focused list's cursor by `delta`, wrapping at the ends.
     fn move_cursor(&mut self, delta: i32) {
         let (cursor, len) = match self.tab {
+            Tab::View => (&mut self.view_cursor, self.view_tracks.len()),
             Tab::Library => {
                 if self.tracks_focused {
                     (&mut self.tracks_cursor, self.tracks.len())
@@ -359,12 +791,32 @@ impl App {
                 self.tracks_focused = true;
                 self.tracks_cursor = 0;
                 self.load_tracks(&jobs, &id);
-                self.say(format!("Opening {name}..."));
-                let client = jobs.client.clone();
-                jobs.submit(
-                    async move { client.play_context(None, &uri, None).await.map_err(anyhow::Error::from) },
-                    done("play playlist"),
-                );
+                match self.source {
+                    Source::Local => {
+                        // The track list arrives as an event; opening plays
+                        // its first track through the built-in player then.
+                        self.local_playlist_play = true;
+                        if self.local.is_none() {
+                            self.say(format!("Opening {name}; starting the local player..."));
+                            self.ensure_local_player(&jobs);
+                        } else {
+                            self.say(format!("Opening {name}..."));
+                        }
+                    }
+                    Source::Remote if !self.has_active_device() => {
+                        self.say("No Spotify device found; press t to stream locally, or open the Spotify app");
+                    }
+                    Source::Remote => {
+                        self.say(format!("Opening {name}..."));
+                        let client = jobs.client.clone();
+                        jobs.submit(
+                            async move {
+                                client.play_context(None, &uri, None).await.map_err(anyhow::Error::from)
+                            },
+                            done("play playlist"),
+                        );
+                    }
+                }
             }
             _ => {
                 let Some(track) = self.selected_track() else {
@@ -372,11 +824,31 @@ impl App {
                 };
                 let uri = track.uri.clone();
                 self.set_playing_track(&track);
-                let client = jobs.client.clone();
-                jobs.submit(
-                    async move { client.play(None, &[uri]).await.map_err(anyhow::Error::from) },
-                    done("play track"),
-                );
+                match self.source {
+                    Source::Local => {
+                        let (tracks, index) = self
+                            .selection_list()
+                            .unwrap_or_else(|| (vec![track.clone()], 0));
+                        match self.local.clone() {
+                            Some(local) => self.start_local(&local, tracks, index),
+                            None => {
+                                self.pending_local_start = Some((tracks, index));
+                                self.say("Starting the local player...");
+                                self.ensure_local_player(jobs);
+                            }
+                        }
+                    }
+                    Source::Remote if !self.has_active_device() => {
+                        self.say("No Spotify device found; press t to stream locally, or open the Spotify app");
+                    }
+                    _ => {
+                        let client = jobs.client.clone();
+                        jobs.submit(
+                            async move { client.play(None, &[uri]).await.map_err(anyhow::Error::from) },
+                            done("play track"),
+                        );
+                    }
+                }
             }
         }
     }
@@ -391,6 +863,16 @@ impl App {
     }
 
     fn toggle_playback(&mut self, jobs: &Jobs) {
+        if self.source == Source::Local {
+            match self.local.as_ref() {
+                Some(local) => {
+                    local.toggle();
+                    self.apply_local_snapshot();
+                }
+                None => self.say("The local player is still starting"),
+            }
+            return;
+        }
         let Some(playback) = self.playback.as_mut() else {
             self.say("Nothing playing yet; press Enter on a track first");
             return;
@@ -415,6 +897,16 @@ impl App {
     }
 
     fn skip(&mut self, jobs: &Jobs, forward: bool) {
+        if self.source == Source::Local {
+            match self.local.as_ref() {
+                Some(local) => {
+                    local.skip(forward);
+                    self.apply_local_snapshot();
+                }
+                None => self.say("The local player is still starting"),
+            }
+            return;
+        }
         if let Some(playback) = self.playback.as_mut() {
             playback.progress_ms = 0;
             self.playback_at = Some(Instant::now());
@@ -433,7 +925,31 @@ impl App {
         );
     }
 
+    /// Nudge the local playhead by `delta_ms`; seeks are a local-player
+    /// affordance, Spotify devices skip instead.
+    fn seek(&mut self, jobs: &Jobs, delta_ms: i64) {
+        if self.source != Source::Local {
+            return self.skip(jobs, delta_ms > 0);
+        }
+        match self.local.as_ref() {
+            Some(local) => {
+                local.seek_by(delta_ms);
+                self.apply_local_snapshot();
+            }
+            None => self.say("The local player is still starting"),
+        }
+    }
+
     fn toggle_shuffle(&mut self, jobs: &Jobs) {
+        if self.source == Source::Local {
+            if let Some(local) = self.local.as_ref() {
+                local.shuffle_queue();
+                self.apply_local_snapshot();
+                let on = self.playback.as_ref().is_some_and(|p| p.shuffle);
+                self.say(if on { "Shuffle on" } else { "Shuffle off" });
+            }
+            return;
+        }
         let Some(playback) = self.playback.as_mut() else {
             return;
         };
@@ -447,6 +963,10 @@ impl App {
     }
 
     fn cycle_repeat(&mut self, jobs: &Jobs) {
+        if self.source == Source::Local {
+            self.say("Repeat applies to Spotify devices; local playback runs the list in order");
+            return;
+        }
         let Some(playback) = self.playback.as_mut() else {
             return;
         };
@@ -464,6 +984,21 @@ impl App {
     }
 
     fn change_volume(&mut self, jobs: &Jobs, delta: i32) {
+        if self.source == Source::Local {
+            match self.local.as_ref() {
+                Some(local) => {
+                    let current = match self.playback.as_ref().and_then(|p| p.volume_percent) {
+                        Some(percent) => percent as i32,
+                        None => 50,
+                    };
+                    let next = (current + delta).clamp(0, 100) as u8;
+                    local.set_volume_percent(next);
+                    self.apply_local_snapshot();
+                }
+                None => self.say("The local player is still starting"),
+            }
+            return;
+        }
         let Some(playback) = self.playback.as_mut() else {
             return;
         };
@@ -478,6 +1013,10 @@ impl App {
     }
 
     fn queue_selection(&mut self, jobs: &Jobs) {
+        if self.source == Source::Local {
+            self.say("Queueing works on Spotify devices; local playback follows the list");
+            return;
+        }
         let Some(track) = self.selected_track() else {
             return;
         };
@@ -489,6 +1028,10 @@ impl App {
 
     /// Transfer playback to the next known device.
     fn next_device(&mut self, jobs: &Jobs) {
+        if self.source == Source::Local {
+            self.say("This terminal is the device; press t to switch to Spotify devices");
+            return;
+        }
         if self.devices.len() < 2 {
             self.say("No other Spotify Connect device found");
             return;
@@ -507,18 +1050,63 @@ impl App {
     // --- Mouse -------------------------------------------------------------------
 
     fn on_mouse(&mut self, mouse: ratatui::crossterm::event::MouseEvent, jobs: &Jobs) {
-        use ratatui::crossterm::event::MouseEventKind;
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
         match mouse.kind {
             MouseEventKind::ScrollUp => self.move_cursor(-1),
             MouseEventKind::ScrollDown => self.move_cursor(1),
-            MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
-                if self.tab == Tab::Library {
-                    // Clicking a pane focuses it; the click row selects there.
-                    let on_tracks = mouse.column > 30;
-                    self.tracks_focused = on_tracks;
-                }
-                if self.selected_track().is_some() {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let row = mouse.row;
+                let column = mouse.column;
+                if self.zones.playlists .contains(ratatui::layout::Position { x: column, y: row }) {
+                    self.tracks_focused = false;
+                    let index = row - self.zones.playlists.y;
+                    if index as usize > self.playlists.len() { return; }
+                    if index == 0 {
+                        // Liked Songs, row 0 in the list.
+                        self.tracks_focused = true;
+                        self.load_tracks(jobs, LIKED_KEY);
+                        self.say("Opening Liked Songs...");
+                        return;
+                    }
+                    self.playlists_cursor = index as usize - 1;
                     self.play_selection(jobs);
+                    return;
+                }
+                if self.zones.tracks .contains(ratatui::layout::Position { x: column, y: row }) {
+                    let index = (row - self.zones.tracks.y + self.zones.tracks_leading_rows) as usize;
+                    if index >= self.tracks.len() { return; }
+                    self.tracks_focused = true;
+                    self.tab = Tab::Library;
+                    self.tracks_cursor = index;
+                    self.play_selection(jobs);
+                    return;
+                }
+                if self.zones.results .contains(ratatui::layout::Position { x: column, y: row }) {
+                    self.tab = Tab::Search;
+                    let index = (row - self.zones.results.y) as usize;
+                    if index >= self.search_results.len() { return; }
+                    self.search_cursor = index;
+                    if matches!(self.source, Source::Local) {
+                        if let Some(local) = self.local.clone() {
+                            self.set_playing_track(self.selected_track().as_ref().unwrap());
+                            let mut queue = self.search_results.clone();
+                            let head: Vec<Track> = queue.drain(..index).collect();
+                            queue.extend(head);
+                            self.start_local(&local, queue,0);
+                        } else {
+                            self.pending_local_start = Some((self.search_results.clone(), index));
+                        }
+                        return;
+                    }
+                    self.play_selection(jobs);
+                    return;
+                }
+                if self.zones.view .contains(ratatui::layout::Position { x: column, y: row }) {
+                    self.tab = Tab::View;
+                    let index = (row - self.zones.view.y) as usize;
+                    if index >= self.view_tracks.len() { return; }
+                    self.view_cursor = index;
+                    self.play_view_selection();
                 }
             }
             _ => {}
@@ -527,7 +1115,7 @@ impl App {
 
     // --- Events -----------------------------------------------------------------
 
-    fn on_event(&mut self, event: AppEvent) {
+    fn on_event(&mut self, event: AppEvent, jobs: &Jobs) {
         match event {
             AppEvent::Playback(result) => {
                 self.pending = self.pending.saturating_sub(1);
@@ -552,6 +1140,14 @@ impl App {
                 if self.tracks_key.as_deref() == Some(key.as_str()) {
                     self.tracks = tracks;
                     self.tracks_cursor = self.tracks_cursor.min(self.tracks.len().saturating_sub(1));
+                    if self.local_playlist_play && self.source == Source::Local && !self.tracks.is_empty() {
+                        self.local_playlist_play = false;
+                        let tracks = self.tracks.clone();
+                        match self.local.clone() {
+                            Some(local) => self.start_local(&local, tracks, 0),
+                            None => self.pending_local_start = Some((tracks, 0)),
+                        }
+                    }
                 }
             }
             AppEvent::SearchResults(tracks) => {
@@ -568,9 +1164,99 @@ impl App {
             AppEvent::Done { action, outcome } => {
                 self.pending = self.pending.saturating_sub(1);
                 if let Err(e) = outcome {
-                    self.say(format!("{action}: {e}"));
+                    self.say_error(format!("{action}: {e}"));
                 }
             }
+            AppEvent::PlayerReady(result) => {
+                self.pending = self.pending.saturating_sub(1);
+                match result {
+                    Ok(local) => {
+                        // Forward player state changes into the event queue.
+                        let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel();
+                        local.watch(signal_tx);
+                        let event_tx = jobs.tx.clone();
+                        jobs.handle.spawn(async move {
+                            while let Some(signal) = signal_rx.recv().await {
+                                let _ = event_tx.send(AppEvent::LocalSignal(signal));
+                            }
+                        });
+                        self.local = Some(local);
+                        self.apply_local_snapshot();
+                        if let Some((tracks, index)) = self.pending_local_start.take() {
+                            let local = self.local.clone().expect("stored just above");
+                            self.start_local(&local, tracks, index);
+                        } else {
+                            self.say("Output: this terminal");
+                        }
+                    }
+                    Err(e) => {
+                        self.source = Source::Remote;
+                        self.say_error(format!(
+                            "Local player failed: {e} — press t to retry, it keeps this message on screen"
+                        ));
+                        self.refresh_playback(jobs);
+                    }
+                }
+            }
+            AppEvent::Cover { uri, art } => {
+                self.pending = self.pending.saturating_sub(1);
+                self.cover_request = None;
+                if self
+                    .playback
+                    .as_ref()
+                    .and_then(|p| p.track.as_ref())
+                    .is_some_and(|track| track.uri == uri)
+                {
+                    // Render into a panel of this many cells, keeping the
+                    // aspect (the protocols letterbox or crop as asked).
+                    let size = ratatui::layout::Size::new(12, 6);
+                    let protocol = self
+                        .picker
+                        .new_protocol(
+                            art.image.clone(),
+                            size,
+                            ratatui_image::Resize::Fit(None),
+                        )
+                        .ok();
+                    if let Some(protocol) = protocol {
+                        self.cover = Some((uri, protocol));
+                    }
+                }
+            }
+            AppEvent::LocalSignal(signal) => match signal {
+                crate::player::LocalSignal::Status => self.apply_local_snapshot(),
+                crate::player::LocalSignal::Ended => {
+                    self.apply_local_snapshot();
+                    self.request_radio(jobs);
+                }
+                crate::player::LocalSignal::Error(message) => {
+                    self.apply_local_snapshot();
+                    self.say_error(message);
+                }
+            },
+            AppEvent::RadioTracks { tracks, .. } => {
+                self.radio_seed = None;
+                if let Some(local) = self.local.as_ref() {
+                    let added = local.extend_queue(tracks);
+                    self.apply_local_snapshot();
+                    match added {
+                        Some(_) => self.say("Radio: similar tracks queued"),
+                        None => self.say("Queue finished"),
+                    }
+                }
+            }
+            AppEvent::ViewCatalog { for_track, artist, tracks } => {
+                if self.view_for.as_deref() == Some(for_track.as_str()) {
+                    self.view_heading = format!("{artist} — top tracks");
+                    self.view_tracks = tracks;
+                    self.view_cursor = 0;
+                }
+            }
+            AppEvent::ViewLyrics { for_track, lyrics } => {
+                if self.view_for.as_deref() == Some(for_track.as_str()) {
+                    self.view_lyrics = lyrics;
+                }
+            },
         }
     }
 }

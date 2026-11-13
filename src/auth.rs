@@ -24,6 +24,8 @@ pub const REDIRECT_PORT: u16 = 8989;
 pub const REDIRECT_URI: &str = "http://127.0.0.1:8989/callback";
 
 /// Scopes the app needs: playback control, library and playlist reads.
+/// `user-read-private` lifts the plan (Free or Premium) from `/me`, which
+/// decides whether local streaming is offered at all.
 pub const SCOPES: &[&str] = &[
     "playlist-read-private",
     "playlist-read-collaborative",
@@ -33,12 +35,94 @@ pub const SCOPES: &[&str] = &[
     "user-read-playback-state",
     "user-read-currently-playing",
     "user-modify-playback-state",
+    "user-read-private",
 ];
 
 /// Refresh this long before the access token actually expires.
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 /// How long the loopback listener waits for the browser to come back.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+// --- Streaming credentials (built-in player) ------------------------------
+//
+// Spotify's streaming access points only accept tokens from Spotify's own
+// OAuth clients, not tokens minted for a developer-dashboard app (the same
+// lesson Spotifast encodes in its "playback grant"). The built-in player
+// therefore keeps a separate grant: Spotify's desktop-app client id, the
+// `streaming` scope, and a loopback redirect on port 8898. The one-time
+// token is exchanged inside librespot for a durable reusable credential,
+// saved in `streaming/credentials.json`; sessions after the first never
+// touch the OAuth flow again.
+
+/// Spotify's own desktop client identity, the one librespot streams with.
+pub const PLAYBACK_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+/// The port the streaming consent redirect uses.
+pub const STREAMING_REDIRECT_PORT: u16 = 8898;
+const STREAMING_REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
+
+fn streaming_authorize_url(challenge: &str) -> String {
+    // show_dialog forces a full consent, so a browser that is already signed
+    // in cannot silently approve without the streaming scope.
+    let mut url: reqwest::Url = AUTHORIZE_URL.parse().expect("static URL");
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", PLAYBACK_CLIENT_ID)
+        .append_pair("scope", "streaming")
+        .append_pair("redirect_uri", STREAMING_REDIRECT_URI)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("code_challenge", challenge)
+        .append_pair("show_dialog", "true");
+    url.to_string()
+}
+
+/// Run the streaming grant: a second browser consent whose code is exchanged
+/// for an access token with the `streaming` scope, then traded for a durable
+/// reusable librespot credential.
+pub async fn login_streaming(dir: &Path) -> anyhow::Result<()> {
+    let (verifier, challenge) = pkce_pair();
+    let url = streaming_authorize_url(&challenge);
+    println!("Opening your browser once more to enable local streaming...");
+    let _ = open_browser(&url);
+    let code = wait_for_code(STREAMING_REDIRECT_PORT, "/login").await?;
+    let http = reqwest::Client::new();
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", STREAMING_REDIRECT_URI),
+        ("client_id", PLAYBACK_CLIENT_ID),
+        ("code_verifier", verifier.as_str()),
+    ];
+    let tokens = token_request(&http, &params).await?;
+    // Prove the grant streams, and bank the reusable credential librespot
+    // mints from it, so later sessions skip this flow entirely.
+    let cache = librespot::core::cache::Cache::new(Some(dir.join("streaming")), None, None, None)?;
+    let session = librespot::core::Session::new(librespot::core::config::SessionConfig::default(), Some(cache));
+    session
+        .connect(
+            librespot::core::authentication::Credentials::with_access_token(tokens.access_token),
+            true,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Spotify refused the streaming session: {e}"))?;
+    Ok(())
+}
+
+/// Credentials for the built-in player: the reusable grant banked by
+/// `login_streaming`, if it exists.
+pub async fn streaming_credentials(dir: &Path) -> anyhow::Result<librespot::core::authentication::Credentials> {
+    let cache = librespot::core::cache::Cache::new(Some(dir.join("streaming")), None, None, None)?;
+    cache.credentials().ok_or_else(|| {
+        anyhow::anyhow!(
+            "local streaming is not enabled. Run `spotcli login` and approve              the streaming permission in the browser."
+        )
+    })
+}
+
+/// Remove stored streaming credentials (logout).
+pub fn clear_streaming(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir.join("streaming"));
+}
+
 
 /// A login rejected by Spotify, or a listener that nobody answered.
 #[derive(Debug, thiserror::Error)]
@@ -74,12 +158,15 @@ pub fn authorize_url(client_id: &str, challenge: &str) -> String {
 
 /// Wait for Spotify's redirect on the loopback listener and return its code.
 ///
-/// Binds `127.0.0.1:8989`, serves exactly one request, and answers it with a
-/// small page the user can close.
-pub async fn wait_for_authorization() -> std::result::Result<String, AuthError> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", REDIRECT_PORT))
+/// Binds `127.0.0.1:{port}`, serves exactly one request, and answers it with
+/// a small page the user can close.
+pub async fn wait_for_code(
+    port: u16,
+    expected_path: &'static str,
+) -> std::result::Result<String, AuthError> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
-        .map_err(|e| AuthError::Rejected(format!("could not bind port {REDIRECT_PORT}: {e}")))?;
+        .map_err(|e| AuthError::Rejected(format!("could not bind port {port}: {e}")))?;
 
     let stream = tokio::time::timeout(LOGIN_TIMEOUT, listener.accept())
         .await
@@ -100,7 +187,7 @@ pub async fn wait_for_authorization() -> std::result::Result<String, AuthError> 
         .nth(1)
         .ok_or_else(|| AuthError::Rejected("malformed request".to_string()))?;
     let path = target.split('?').next().unwrap_or_default();
-    if path != "/callback" {
+    if path != expected_path {
         return Err(AuthError::Rejected(format!("unexpected path: {path}")));
     }
 
@@ -255,7 +342,7 @@ pub async fn login(
     println!("  {url}");
     let _ = open_browser(&url);
 
-    let code = wait_for_authorization().await?;
+    let code = wait_for_code(REDIRECT_PORT, "/callback").await?;
     let tokens = exchange(http, client_id, &code, &verifier)
         .await
         .map_err(|e| crate::api::ApiError::Network(e.to_string()))?;

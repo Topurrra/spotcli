@@ -10,6 +10,8 @@ pub struct Track {
     pub artists: String,
     pub album: String,
     pub duration_ms: u64,
+    /// Smallest usable album-art URL, for the now-playing panel.
+    pub cover_url: Option<String>,
 }
 
 impl Track {
@@ -109,6 +111,16 @@ pub(crate) struct RawArtist {
 pub(crate) struct RawAlbum {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub images: Vec<RawImage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawImage {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +226,10 @@ fn artists_label(artists: &[RawArtist]) -> String {
 }
 
 pub(crate) fn map_track(raw: RawTrack) -> Track {
+    let cover_url = raw
+        .album
+        .as_ref()
+        .and_then(|album| smallest_cover(&album.images).and_then(|image| image.url.clone()));
     Track {
         id: raw.id.unwrap_or_default(),
         uri: raw.uri.unwrap_or_default(),
@@ -221,7 +237,23 @@ pub(crate) fn map_track(raw: RawTrack) -> Track {
         artists: artists_label(&raw.artists),
         album: raw.album.and_then(|a| a.name).unwrap_or_default(),
         duration_ms: raw.duration_ms.unwrap_or_default(),
+        cover_url,
     }
+}
+
+/// The smallest image that is still big enough for a 16x8 cell panel; tiny
+/// covers avoid pulling 640px jpegs for a two-digit pixel render.
+pub(crate) fn smallest_cover(images: &[RawImage]) -> Option<&RawImage> {
+    let mut usable: Vec<&RawImage> = images
+        .iter()
+        .filter(|image| image.url.is_some())
+        .collect();
+    usable.sort_by_key(|image| image.width.unwrap_or(u32::MAX));
+    usable
+        .iter()
+        .find(|image| image.width.unwrap_or(0) >= 120)
+        .or_else(|| usable.first())
+        .copied()
 }
 
 pub(crate) fn map_playlist(raw: RawPlaylist) -> Playlist {
@@ -274,6 +306,20 @@ pub(crate) fn tracks_from_items<T>(items: Vec<T>, f: impl Fn(T) -> Option<RawTra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picks_the_smallest_usable_cover() {
+        let images = vec![
+            RawImage { url: Some("small".into()), width: Some(64) },
+            RawImage { url: Some("mid".into()), width: Some(300) },
+            RawImage { url: Some("big".into()), width: Some(640) },
+        ];
+        assert_eq!(smallest_cover(&images).unwrap().url.as_deref(), Some("mid"));
+        let tiny = vec![
+            RawImage { url: Some("small".into()), width: Some(64) },
+        ];
+        assert_eq!(smallest_cover(&tiny).unwrap().url.as_deref(), Some("small"));
+    }
 
     #[test]
     fn formats_durations() {

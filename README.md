@@ -14,9 +14,16 @@ API, built with [ratatui](https://ratatui.rs).
 - **One-shot commands** - `status`, `play <query>`, `pause`, `next`, `prev`
   for scripts and keybindings outside the TUI.
 
-Playback happens through Spotify itself: spotcli controls your active Spotify
-device (desktop app, phone, browser player, a Connect speaker, ...). It does
-not stream audio itself, so it works with Free and Premium accounts alike.
+- **Playback happens through Spotify itself** - spotcli controls your active
+  Spotify
+  device (desktop app, phone, browser player, a Connect speaker, ...). It only
+  commands playback, so Free and Premium accounts alike can drive everything
+  their account allows.
+- **Built-in streaming (`t` in the TUI)** - press `t` and spotcli becomes the
+  Spotify device itself, streaming to your computer's speakers directly
+  (through [librespot](https://github.com/librespot-org/librespot)). This
+  mode needs a Spotify Premium account, and a token minted with the
+  `streaming` scope (log in again after upgrading an older spotcli).
 
 ## Setup
 

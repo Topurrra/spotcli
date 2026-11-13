@@ -1,15 +1,21 @@
 mod api;
 mod app;
 mod auth;
+mod cover;
+pub mod library;
 mod models;
+mod player;
 mod theme;
 pub mod theme_detect;
 mod ui;
 
 pub use api::Client;
 pub use app::App;
-pub use auth::{login, StoredCredentials, TokenStore};
+pub use auth::{
+    clear_streaming, login, login_streaming, streaming_credentials, StoredCredentials, TokenStore,
+};
 pub use models::{Device, Playback, Playlist, Track, User};
+pub use player::{LocalPlayer, LocalSignal};
 pub use theme::Theme;
 
 use anyhow::{Context, Result};

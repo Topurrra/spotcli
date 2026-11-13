@@ -72,6 +72,7 @@ async fn dispatch(cli: Cli, runtime: &tokio::runtime::Runtime) -> Result<()> {
         Some(Command::Login { client_id }) => login(client_id).await,
         Some(Command::Logout) => {
             TokenStore::clear(&config_dir()?);
+            spotcli::clear_streaming(&config_dir()?);
             println!("Credentials removed.");
             Ok(())
         }
@@ -119,6 +120,14 @@ async fn login(client_id: Option<String>) -> Result<()> {
         "Signed in. Credentials saved to {}",
         dir.join("credentials.json").display()
     );
+    // The built-in player streams with its own grant (Spotify's access
+    // points only mint streaming sessions from Spotify's own OAuth
+    // clients), so set it up in the same pass.
+    println!("Enabling local streaming: a second browser consent follows...");
+    match spotcli::login_streaming(&dir).await {
+        Ok(()) => println!("Local streaming enabled."),
+        Err(e) => println!("Local streaming not enabled ({e}); press t in the TUI to try again."),
+    }
     Ok(())
 }
 
@@ -178,8 +187,13 @@ async fn one_shot(command: Command) -> Result<()> {
 
 async fn run_tui(runtime: &tokio::runtime::Runtime, theme: spotcli::Theme) -> Result<()> {
     let client = Client::from_dir(&config_dir()?)?;
+    // Terminal image-protocol probe asks over stdio and must happen before
+    // ratatui takes over; every terminal answers something, and the
+    // halfblocks fallback keeps the panel working everywhere.
+    let picker = ratatui_image::picker::Picker::from_query_stdio()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
     let mut terminal = ratatui::init();
-    let result = App::with_theme(theme).run(&mut terminal, client, runtime.handle().clone());
+    let result = App::with_theme(theme, picker).run(&mut terminal, client, runtime.handle().clone());
     ratatui::restore();
     result
 }

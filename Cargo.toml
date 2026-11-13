@@ -22,15 +22,28 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Built-in streaming (rodio playback + webpki TLS, matching the reqwest stack
+# above instead of librespot's default native-tls).
+librespot = { version = "0.8.0", default-features = false, features = [
+    "rodio-backend",
+    "rustls-tls-webpki-roots",
+] }
 open = "5"
 rand = "0.9"
+# Batched metadata reads for session-backed playlist browsing.
+futures = "0.3"
+# Decoding spclient playlist payloads (playlist4 external format).
+protobuf = "3"
+# Decoding album art for the now-playing panel.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ratatui = "0.30"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
