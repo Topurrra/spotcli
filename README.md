@@ -87,6 +87,14 @@ The default, `auto`, picks dark or light from your terminal's background.
 spotcli status | play "query" | pause | next | prev | devices | me | logout
 ```
 
+## Development
+
+```sh
+git config core.hooksPath .githooks   # run checks before every push
+scripts/check.sh                      # tests + clippy
+scripts/release.sh 1.1.0              # bump, build, tag, publish
+```
+
 ## License
 
 MIT

@@ -1,11 +1,11 @@
 name: Release
 
-# Pushing a tag like v1.0.0 builds spotcli for every platform and attaches
-# the archives to the GitHub release of that tag (created if missing).
+# Pushing a tag like v1.0.0 (scripts/release.sh does it) builds spotcli for
+# Windows, Linux and macOS and attaches the archives to that tag's release.
+# Rebuild an existing tag by hand:  gh workflow run release.yml -f tag=v1.0.0
 on:
   push:
     tags: ["v*"]
-  # Rebuild an existing tag by hand: gh workflow run release.yml -f tag=v1.0.0
   workflow_dispatch:
     inputs:
       tag:
