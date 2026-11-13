@@ -10,9 +10,9 @@ use thiserror::Error;
 
 use crate::auth;
 use crate::models::{
-    Device, Playback, Playlist, RawDevice, RawPaging, RawPlayback, RawPlaylist, RawPlaylistItem,
-    RawSavedTrack, RawSearch, RawUser, Track, User, map_device, map_playlist,
-    map_playback, map_track,
+    Album, Artist, Device, Playback, Playlist, RawDevice, RawFullAlbum, RawPaging, RawPlayback,
+    RawPlaylist, RawPlaylistItem, RawSavedTrack, RawSearch, RawTopTracks, RawUser, Track, User,
+    map_device, map_playback, map_playlist, map_search_album, map_search_artist, map_track,
 };
 
 const BASE_URL: &str = "https://api.spotify.com/v1";
@@ -42,6 +42,22 @@ impl ApiError {
     /// A 401, which a token refresh may fix.
     pub fn is_auth(&self) -> bool {
         matches!(self, ApiError::SessionExpired)
+    }
+
+    /// An HTTP status of `code`.
+    fn has_status(&self, code: u16) -> bool {
+        matches!(self, ApiError::Status { status, .. } if *status == code)
+    }
+
+    /// Turn a failed write call (like, add to playlist) into a user-facing
+    /// error: a refused token needs the new scopes from a fresh login.
+    pub fn into_write_error(self) -> anyhow::Error {
+        match self {
+            ApiError::SessionExpired | ApiError::Status { status: 401 | 403, .. } => {
+                anyhow::anyhow!("Missing permission — run `spotcli login` again")
+            }
+            other => other.into(),
+        }
     }
 }
 
@@ -273,20 +289,123 @@ impl Client {
 
     /// Search tracks, up to `limit` results.
     pub async fn search_tracks(&self, query: &str, limit: u32) -> Result<Vec<Track>> {
+        Ok(self.search_tracks_page(query, limit, 0).await?.0)
+    }
+
+    /// One page of track search results starting at `offset`, plus the offset
+    /// of the next page when more matches exist. Development-mode apps may be
+    /// capped to smaller pages (a 400 for the limit), so a refused limit is
+    /// retried once at 10.
+    pub async fn search_tracks_page(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Track>, Option<u32>)> {
+        let raw = self.search_raw("track", query, limit, offset).await?;
+        let Some(page) = raw.tracks else {
+            return Ok((Vec::new(), None));
+        };
+        let received = page.items.len() as u32;
+        let next = (received > 0 && u64::from(offset + received) < page.total)
+            .then_some(offset + received);
+        let tracks = page.items.into_iter().filter(is_playable).map(map_track).collect();
+        Ok((tracks, next))
+    }
+
+    /// Artists, albums and playlists matching `query` in one request.
+    pub async fn search_extras(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<(Vec<Artist>, Vec<Album>, Vec<Playlist>)> {
+        let raw = self.search_raw("artist,album,playlist", query, limit, 0).await?;
+        let artists = raw
+            .artists
+            .map(|p| p.items.into_iter().flatten().map(map_search_artist).collect())
+            .unwrap_or_default();
+        let albums = raw
+            .albums
+            .map(|p| p.items.into_iter().flatten().map(map_search_album).collect())
+            .unwrap_or_default();
+        let playlists = raw
+            .playlists
+            .map(|p| p.items.into_iter().flatten().map(map_playlist).collect())
+            .unwrap_or_default();
+        Ok((artists, albums, playlists))
+    }
+
+    async fn search_raw(&self, kinds: &str, query: &str, limit: u32, offset: u32) -> Result<RawSearch> {
         let encoded = urlencode(query);
-        let raw: RawSearch = self
-            .get(&format!("/search?type=track&limit={limit}&q={encoded}"))
-            .await?;
-        Ok(raw
+        let path = |limit: u32| {
+            format!("/search?type={kinds}&limit={limit}&offset={offset}&q={encoded}")
+        };
+        match self.get(&path(limit)).await {
+            Err(e) if e.has_status(400) && limit > 10 => self.get(&path(10)).await,
+            other => other,
+        }
+    }
+
+    /// An album's tracks (the first 50), each carrying the album's name and art.
+    pub async fn album_tracks(&self, id: &str) -> Result<Vec<Track>> {
+        let album: RawFullAlbum = self.get(&format!("/albums/{id}")).await?;
+        let cover = crate::models::smallest_cover(&album.images).and_then(|i| i.url.clone());
+        let name = album.name.unwrap_or_default();
+        Ok(album
             .tracks
-            .map(|page| {
-                page.items
-                    .into_iter()
-                    .filter(is_playable)
-                    .map(map_track)
-                    .collect()
+            .map(|page| page.items)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(is_playable)
+            .map(|raw| {
+                let mut track = map_track(raw);
+                track.album = name.clone();
+                track.cover_url = cover.clone();
+                track
             })
-            .unwrap_or_default())
+            .collect())
+    }
+
+    /// An artist's top tracks in the user's market.
+    pub async fn artist_top_tracks(&self, id: &str) -> Result<Vec<Track>> {
+        let top: RawTopTracks = self
+            .get(&format!("/artists/{id}/top-tracks?market=from_token"))
+            .await?;
+        Ok(top.tracks.into_iter().filter(is_playable).map(map_track).collect())
+    }
+
+    /// Save tracks to the user's Liked Songs. Falls back to the newer
+    /// library endpoint when `/me/tracks` is gone (404).
+    pub async fn save_tracks(&self, ids: &[String]) -> Result<()> {
+        let body = serde_json::json!({ "ids": ids });
+        match self.send(Method::PUT, "/me/tracks", Some(body)).await {
+            Err(e) if e.has_status(404) => {
+                let uris: Vec<String> = ids.iter().map(|id| format!("spotify:track:{id}")).collect();
+                self.send(
+                    Method::PUT,
+                    &format!("/me/library?uris={}", urlencode(&uris.join(","))),
+                    None,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    /// Append tracks to a playlist. Uses `/items`, retrying the legacy
+    /// `/tracks` path once when the first answers 404.
+    pub async fn playlist_add(&self, playlist_id: &str, uris: &[String]) -> Result<()> {
+        let body = serde_json::json!({ "uris": uris });
+        match self
+            .send(Method::POST, &format!("/playlists/{playlist_id}/items"), Some(body.clone()))
+            .await
+        {
+            Err(e) if e.has_status(404) => {
+                self.send(Method::POST, &format!("/playlists/{playlist_id}/tracks"), Some(body))
+                    .await
+            }
+            other => other,
+        }
     }
 
     /// The playback state, or `None` when nothing is playing anywhere.

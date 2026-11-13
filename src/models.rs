@@ -27,6 +27,31 @@ pub struct Playlist {
     pub uri: String,
     pub name: String,
     pub owner: String,
+    /// The owner's Spotify user id (empty when the payload omitted it).
+    pub owner_id: String,
+    /// Anyone invited can add tracks.
+    pub collaborative: bool,
+    pub track_count: u64,
+}
+
+/// An artist search result.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Artist {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub followers: Option<u64>,
+}
+
+/// An album search result.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Album {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub artists: String,
+    /// Release year, or empty when unknown.
+    pub year: String,
     pub track_count: u64,
 }
 
@@ -128,6 +153,8 @@ pub(crate) struct RawPlaylist {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
+    pub collaborative: bool,
+    #[serde(default)]
     pub uri: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
@@ -139,6 +166,8 @@ pub(crate) struct RawPlaylist {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawOwner {
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -215,6 +244,87 @@ pub(crate) struct RawPlayback {
 pub(crate) struct RawSearch {
     #[serde(default)]
     pub tracks: Option<RawPaging<RawTrack>>,
+    #[serde(default)]
+    pub artists: Option<RawPaging<Option<RawSearchArtist>>>,
+    #[serde(default)]
+    pub albums: Option<RawPaging<Option<RawSearchAlbum>>>,
+    /// Playlist pages contain `null` holes for removed playlists.
+    #[serde(default)]
+    pub playlists: Option<RawPaging<Option<RawPlaylist>>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawFollowers {
+    #[serde(default)]
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawSearchArtist {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub followers: Option<RawFollowers>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawSearchAlbum {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub artists: Vec<RawArtist>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub total_tracks: Option<u64>,
+}
+
+/// GET /albums/{id}: the album with its first page of tracks.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawFullAlbum {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub images: Vec<RawImage>,
+    #[serde(default)]
+    pub tracks: Option<RawPaging<RawTrack>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawTopTracks {
+    #[serde(default)]
+    pub tracks: Vec<RawTrack>,
+}
+
+pub(crate) fn map_search_artist(raw: RawSearchArtist) -> Artist {
+    Artist {
+        id: raw.id.unwrap_or_default(),
+        uri: raw.uri.unwrap_or_default(),
+        name: raw.name.unwrap_or_else(|| "(unknown artist)".to_string()),
+        followers: raw.followers.and_then(|f| f.total),
+    }
+}
+
+pub(crate) fn map_search_album(raw: RawSearchAlbum) -> Album {
+    Album {
+        id: raw.id.unwrap_or_default(),
+        uri: raw.uri.unwrap_or_default(),
+        name: raw.name.unwrap_or_else(|| "(unknown album)".to_string()),
+        artists: artists_label(&raw.artists),
+        year: raw
+            .release_date
+            .map(|d| d.chars().take(4).collect())
+            .unwrap_or_default(),
+        track_count: raw.total_tracks.unwrap_or_default(),
+    }
 }
 
 fn artists_label(artists: &[RawArtist]) -> String {
@@ -261,7 +371,9 @@ pub(crate) fn map_playlist(raw: RawPlaylist) -> Playlist {
         id: raw.id.unwrap_or_default(),
         uri: raw.uri.unwrap_or_default(),
         name: raw.name.unwrap_or_else(|| "(unnamed playlist)".to_string()),
+        owner_id: raw.owner.as_ref().and_then(|o| o.id.clone()).unwrap_or_default(),
         owner: raw.owner.and_then(|o| o.display_name).unwrap_or_default(),
+        collaborative: raw.collaborative,
         track_count: raw.tracks.map(|t| t.total).unwrap_or_default(),
     }
 }
@@ -319,6 +431,26 @@ mod tests {
             RawImage { url: Some("small".into()), width: Some(64) },
         ];
         assert_eq!(smallest_cover(&tiny).unwrap().url.as_deref(), Some("small"));
+    }
+
+    #[test]
+    fn maps_search_extras_and_tolerates_null_playlists() {
+        let raw: RawSearch = serde_json::from_str(
+            r#"{
+                "artists": {"items": [{"id": "a1", "uri": "spotify:artist:a1", "name": "Band", "followers": {"total": 42}}], "total": 1},
+                "albums": {"items": [{"id": "b1", "uri": "spotify:album:b1", "name": "LP", "artists": [{"name": "Band"}], "release_date": "2019-05-03", "total_tracks": 11}], "total": 1},
+                "playlists": {"items": [null, {"id": "p1", "uri": "spotify:playlist:p1", "name": "Mix", "owner": {"id": "me", "display_name": "Me"}, "collaborative": true}], "total": 2}
+            }"#,
+        )
+        .unwrap();
+        let artist = map_search_artist(raw.artists.unwrap().items.into_iter().flatten().next().unwrap());
+        assert_eq!((artist.name.as_str(), artist.followers), ("Band", Some(42)));
+        let album = map_search_album(raw.albums.unwrap().items.into_iter().flatten().next().unwrap());
+        assert_eq!((album.year.as_str(), album.track_count, album.artists.as_str()), ("2019", 11, "Band"));
+        let playlists: Vec<_> = raw.playlists.unwrap().items.into_iter().flatten().map(map_playlist).collect();
+        assert_eq!(playlists.len(), 1);
+        assert!(playlists[0].collaborative);
+        assert_eq!(playlists[0].owner_id, "me");
     }
 
     #[test]

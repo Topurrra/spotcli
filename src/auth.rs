@@ -31,6 +31,8 @@ pub const SCOPES: &[&str] = &[
     "playlist-read-collaborative",
     "user-library-read",
     "user-library-modify",
+    "playlist-modify-public",
+    "playlist-modify-private",
     "user-top-read",
     "user-read-playback-state",
     "user-read-currently-playing",

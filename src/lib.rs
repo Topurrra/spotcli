@@ -6,6 +6,7 @@ pub mod library;
 mod models;
 mod player;
 mod theme;
+pub mod settings;
 pub mod theme_detect;
 mod ui;
 
@@ -16,7 +17,7 @@ pub use auth::{
 };
 pub use models::{Device, Playback, Playlist, Track, User};
 pub use player::{LocalPlayer, LocalSignal};
-pub use theme::Theme;
+pub use theme::{by_name, Theme, NAMES};
 
 use anyhow::{Context, Result};
 

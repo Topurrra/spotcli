@@ -16,10 +16,11 @@ use spotcli::{config_dir, App, Client, TokenStore};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Which palette to draw with: auto (ask the terminal), dark, light,
-    /// or terminal (inherit the terminal's own colors).
-    #[arg(long, default_value = "auto")]
-    theme: String,
+    /// Color theme: auto (ask the terminal for its background), dark, light,
+    /// catppuccin, gruvbox, or terminal (inherit the terminal's own colors).
+    /// Overrides the theme saved from inside the TUI (Ctrl+T cycles themes).
+    #[arg(long, value_name = "NAME")]
+    theme: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -71,7 +72,6 @@ fn main() -> ExitCode {
 }
 
 async fn dispatch(cli: Cli, runtime: &tokio::runtime::Runtime) -> Result<()> {
-    let theme = pick_theme(&cli.theme);
     match cli.command {
         Some(Command::Login { client_id }) => login(client_id).await,
         Some(Command::Logout) => {
@@ -81,22 +81,49 @@ async fn dispatch(cli: Cli, runtime: &tokio::runtime::Runtime) -> Result<()> {
             Ok(())
         }
         Some(command) => one_shot(command).await,
-        None => run_tui(runtime, theme).await,
+        None => run_tui(runtime, cli.theme).await,
     }
 }
 
-/// Resolve `--theme`: `auto` asks the terminal for its background color and
-/// picks dark or light from its brightness; anything unrecognized falls
-/// back to dark.
-fn pick_theme(name: &str) -> spotcli::Theme {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "light" => spotcli::Theme::light(),
-        "terminal" => spotcli::Theme::terminal(),
-        "dark" => spotcli::Theme::dark(),
-        _ => match spotcli::theme_detect::detect_background() {
-            Some(background) => spotcli::Theme::for_background(background),
-            None => spotcli::Theme::dark(),
-        },
+/// Resolve the palette. An explicit `--theme` wins, then the theme saved in
+/// `settings.json`, then `auto`. Unknown names warn and fall back to `auto`.
+/// Detection (an OSC 11 query to the terminal) runs only when `auto` is
+/// actually chosen.
+fn pick_theme(flag: Option<&str>) -> spotcli::Theme {
+    let (requested, source) = match flag {
+        Some(name) => (Some(name.to_string()), "--theme"),
+        None => (
+            config_dir()
+                .ok()
+                .and_then(|dir| spotcli::settings::load(&dir).theme),
+            "saved theme",
+        ),
+    };
+    let Some(requested) = requested else {
+        return auto_theme();
+    };
+    let key = requested.trim().to_ascii_lowercase();
+    if key == "auto" {
+        return auto_theme();
+    }
+    match spotcli::by_name(&key) {
+        Some(theme) => theme,
+        None => {
+            eprintln!(
+                "warning: unknown theme {requested:?} from {source}; valid themes are auto, {}",
+                spotcli::NAMES.join(", ")
+            );
+            auto_theme()
+        }
+    }
+}
+
+/// Ask the terminal for its background color and pick dark or light from
+/// its brightness; if the terminal does not answer, use dark.
+fn auto_theme() -> spotcli::Theme {
+    match spotcli::theme_detect::detect_background() {
+        Some(background) => spotcli::Theme::for_background(background),
+        None => spotcli::Theme::dark(),
     }
 }
 
@@ -189,8 +216,10 @@ async fn one_shot(command: Command) -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(runtime: &tokio::runtime::Runtime, theme: spotcli::Theme) -> Result<()> {
+async fn run_tui(runtime: &tokio::runtime::Runtime, theme_flag: Option<String>) -> Result<()> {
     let client = Client::from_dir(&config_dir()?)?;
+    // Resolved before ratatui takes over, since auto-detection queries the terminal.
+    let theme = pick_theme(theme_flag.as_deref());
     // Terminal image-protocol probe asks over stdio and must happen before
     // ratatui takes over; every terminal answers something, and the
     // halfblocks fallback keeps the panel working everywhere.

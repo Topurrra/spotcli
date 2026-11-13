@@ -124,10 +124,9 @@ fn encode_search_query(query: &str) -> String {
     out
 }
 
-/// Search tracks over the streaming session (no Web API quota, so no
-/// development-mode 403s or shared 503s). Results resolve the top `limit`
-/// matches with full metadata, in search order.
-pub async fn search(session: &Session, query: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
+/// Track uris of a `spotify:search:` context, in match order, de-duplicated.
+/// The context carries only tracks (no artists, albums or playlists).
+pub async fn search_uris(session: &Session, query: &str) -> anyhow::Result<Vec<String>> {
     anyhow::ensure!(!query.trim().is_empty(), "empty query");
     let context_uri = format!("spotify:search:{}", encode_search_query(query));
     let context = session.spclient().get_context(&context_uri).await?;
@@ -135,8 +134,7 @@ pub async fn search(session: &Session, query: &str, limit: usize) -> anyhow::Res
     let mut uris: Vec<String> = Vec::new();
     for page in &context.pages {
         for track in &page.tracks {
-            // The context carries the match order; entries without a uri are
-            // placeholder rows (ads, empty slots).
+            // Entries without a uri are placeholder rows (ads, empty slots).
             let Some(uri) = track.uri.as_ref() else {
                 continue;
             };
@@ -144,40 +142,43 @@ pub async fn search(session: &Session, query: &str, limit: usize) -> anyhow::Res
                 && !uris.contains(uri)
             {
                 uris.push(uri.clone());
-                if uris.len() >= limit {
-                    break;
-                }
             }
-        }
-        if uris.len() >= limit {
-            break;
         }
     }
+    Ok(uris)
+}
 
-    let fetches = stream::iter(uris.into_iter().take(limit))
-        .map(|uri| {
-            let session = session.clone();
-            async move {
-                let Ok(track_uri) = SpotifyUri::from_uri(&uri) else {
-                    return None;
-                };
-                let track = SessionTrack::get(&session, &track_uri).await.ok()?;
-                Some(Track {
-                    id: track_uri.to_string(),
-                    uri,
-                    name: track.name.clone(),
-                    artists: artists_label(&track.artists),
-                    album: track.album.name.clone(),
-                    duration_ms: u64::try_from(track.duration.max(0)).unwrap_or(0),
-                    cover_url: cover_url_from_covers(&track.album.covers),
-                })
-            }
-        })
-        .buffer_unordered(8)
-        .filter_map(|entry| async move { entry })
-        .collect::<Vec<_>>()
-        .await;
-    Ok(fetches)
+/// Resolve the first `limit` search matches over the streaming session (no
+/// Web API quota, so no development-mode 403s or shared 503s). Returns the
+/// tracks in search order plus the uris not yet resolved, for paging.
+pub async fn search(
+    session: &Session,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<(Vec<Track>, Vec<String>)> {
+    let mut uris = search_uris(session, query).await?;
+    let rest = uris.split_off(limit.min(uris.len()));
+    Ok((resolve(session, uris).await, rest))
+}
+
+/// An album's tracks in disc order, over the session.
+pub async fn album_tracks(
+    session: &Session,
+    album_id: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Track>> {
+    let uri = SpotifyUri::from_uri(&format!("spotify:album:{album_id}"))
+        .map_err(|e| anyhow::anyhow!("not an album id: {album_id} ({e})"))?;
+    let album = librespot::metadata::Album::get(session, &uri).await?;
+    let uris: Vec<String> = album
+        .discs
+        .0
+        .iter()
+        .flat_map(|disc| disc.tracks.0.iter())
+        .take(limit)
+        .map(|track_uri| track_uri.to_string())
+        .collect();
+    Ok(resolve(session, uris).await)
 }
 
 /// Resolve spclient track metadata for `uris`, in order, skipping entries
@@ -208,11 +209,17 @@ async fn resolve(session: &Session, uris: Vec<String>) -> Vec<Track> {
             ))
             }
         })
-        .buffer_unordered(8)
+        // `buffered` keeps the input order (search rank, top-track rank).
+        .buffered(8)
         .filter_map(|entry| async move { entry })
         .map(|(_, track)| track)
         .collect::<Vec<_>>()
         .await
+}
+
+/// Resolve `uris` (see [`search`]) for the next page of results.
+pub async fn resolve_page(session: &Session, uris: Vec<String>) -> Vec<Track> {
+    resolve(session, uris).await
 }
 
 /// What Spotify itself would queue after `seed_uri`: its radio continuation

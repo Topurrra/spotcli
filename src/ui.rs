@@ -14,13 +14,16 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, List, ListItem, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    Block, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
     ScrollbarState, StatefulWidget, Table, Widget,
 };
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, LyricsState, MouseZones, Tab, COVER_CELLS, LIKED_KEY};
+use crate::app::{
+    App, ExtraState, LyricsState, MoreTracks, MouseZones, SearchCategory, SearchFocus, Tab,
+    COVER_CELLS, LIKED_KEY,
+};
 use crate::models::{format_duration, Playback, Track};
 use crate::theme::Theme;
 
@@ -58,6 +61,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.zones.shuffle_button = shuffle_button;
     app.zones.repeat_button = repeat_button;
     draw_footer(frame, app, &theme, chunks[4]);
+    if app.add_to.is_some() {
+        draw_add_to(frame, app, &theme, area);
+    }
 }
 
 /// The one accent: the cover's color when sampled, else the theme's. Nudged
@@ -298,10 +304,26 @@ fn hints_for(app: &App) -> &'static [(&'static str, &'static str)] {
             ("tab", "search"),
             ("q", "quit"),
         ],
-        Tab::Search => &[
-            ("enter", "search/play"),
-            ("↑↓", "select"),
+        Tab::Search if app.search_focus == SearchFocus::Input => &[
+            ("enter", "search"),
+            ("↓", "results"),
             ("esc", "clear"),
+            ("tab", "view"),
+        ],
+        Tab::Search if app.search_category == SearchCategory::Tracks => &[
+            ("enter", "play"),
+            ("a", "queue"),
+            ("l", "like"),
+            ("p", "playlist"),
+            ("←→", "type"),
+            ("/", "edit"),
+        ],
+        Tab::Search => &[
+            ("enter", "open"),
+            ("←→", "type"),
+            ("1-4", "jump"),
+            ("/", "edit"),
+            ("esc", "back"),
             ("tab", "view"),
         ],
         Tab::View => &[
@@ -460,9 +482,10 @@ fn draw_library(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect, pre
     // Tracks of the selected playlist.
     let title = match app.tracks_key.as_deref() {
         Some(LIKED_KEY) => "LIKED SONGS".to_string(),
-        Some(key) => match app.playlists.iter().find(|p| p.id == key) {
-            Some(playlist) => playlist.name.to_uppercase(),
-            None => "TRACKS".to_string(),
+        Some(key) => match (app.tracks_title.as_deref(), app.playlists.iter().find(|p| p.id == key)) {
+            (Some(title), _) => title.to_uppercase(),
+            (None, Some(playlist)) => playlist.name.to_uppercase(),
+            (None, None) => "TRACKS".to_string(),
         },
         None => "TRACKS".to_string(),
     };
@@ -503,47 +526,402 @@ fn draw_search(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect, prev
     let rows = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)])
         .spacing(1)
         .split(area);
+    let input_focused = app.search_focus == SearchFocus::Input;
+    let results_focused = !input_focused;
 
-    // Input: a raised field with a "/" prefix and a block cursor.
+    // Input: a raised field with a "/" prefix; the block cursor only shows
+    // while the keyboard is typing into it.
     let field = Block::default()
-        .style(Style::default().bg(theme.input_focused_bg))
+        .style(Style::default().bg(if input_focused { theme.input_focused_bg } else { theme.input_bg }))
         .padding(Padding::new(2, 2, 1, 1));
     let inner = field.inner(rows[0]);
     frame.render_widget(field, rows[0]);
-    let mut spans = vec![Span::styled("/ ", Style::default().fg(theme.accent))];
+    let prefix = if input_focused {
+        Style::default().fg(theme.accent)
+    } else {
+        theme.dim_text()
+    };
+    let mut spans = vec![Span::styled("/ ", prefix)];
+    let cursor = |spans: &mut Vec<Span>| {
+        if input_focused {
+            spans.push(Span::styled("▍", Style::default().fg(theme.accent)));
+        }
+    };
     if app.search_input.is_empty() {
-        spans.push(Span::styled("▍", Style::default().fg(theme.accent)));
-        spans.push(Span::styled(" Search tracks and artists", theme.dim_text()));
+        cursor(&mut spans);
+        spans.push(Span::styled(
+            if input_focused { " Search tracks, artists, albums, playlists" } else { "Search tracks, artists, albums, playlists" },
+            theme.dim_text(),
+        ));
     } else {
         let max = inner.width.saturating_sub(4) as usize;
         let text = tail(&app.search_input, max);
-        spans.push(Span::styled(text, theme.text()));
-        spans.push(Span::styled("▍", Style::default().fg(theme.accent)));
+        spans.push(Span::styled(text, if input_focused { theme.text() } else { theme.muted_text() }));
+        cursor(&mut spans);
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    app.zones.search_input = rows[0];
 
-    let loading = app.pending > 0;
-    let count = (!app.search_results.is_empty()).then(|| format!("{} results", app.search_results.len()));
-    let content = panel(frame, rows[1], theme, "RESULTS", true, loading, count.as_deref());
-    let (g, m, h) = if loading {
-        ("", "Searching…", "")
-    } else {
-        ("/", "Search for something", "Type a query and press enter")
-    };
+    let loading = app.search_loading || app.search_extra == ExtraState::Loading;
+    let content = panel(frame, rows[1], theme, "RESULTS", results_focused, loading, None);
+    if content.height == 0 {
+        return;
+    }
+    let [tabs_row, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(content);
+    draw_search_tabs(frame, app, theme, tabs_row, results_focused);
+
+    let category = app.search_category;
+    let extra_state = app.search_extra;
+    let searched = !app.searched_for.is_empty();
     let playing = playing_uri(app);
-    let (items, offset) = track_table(
-        frame,
-        theme,
-        content,
-        &app.search_results,
-        app.search_cursor,
-        prev.results_offset,
-        true,
-        playing.as_ref().map(|(u, p)| (u.as_str(), *p)),
-        (g, m, h),
-    );
+    let (items, offset) = match category {
+        SearchCategory::Tracks => {
+            let more_loading = app.search_more_loading;
+            let (table_area, spinner_row) = if more_loading && list_area.height > 4 {
+                let [table, bottom] =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(list_area);
+                (table, Some(bottom))
+            } else {
+                (list_area, None)
+            };
+            let (g, m, h) = if app.search_loading {
+                ("", "Searching…", "")
+            } else if searched {
+                ("/", "No tracks found", "")
+            } else {
+                ("/", "Search for something", "Results appear as you type; enter searches now")
+            };
+            let result = track_table(
+                frame,
+                theme,
+                table_area,
+                &app.search_results,
+                app.search_cursor,
+                prev.results_offset,
+                results_focused,
+                playing.as_ref().map(|(u, p)| (u.as_str(), *p)),
+                (g, m, h),
+            );
+            if let Some(row) = spinner_row {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("  {} Loading more…", spinner_frame()),
+                        Style::default().fg(theme.accent),
+                    )),
+                    row,
+                );
+            }
+            result
+        }
+        _ => {
+            let len = app.search_len(category);
+            let noun = category.label().to_lowercase();
+            if len == 0 {
+                let (g, m) = match extra_state {
+                    ExtraState::Loading => ("", "Searching…".to_string()),
+                    ExtraState::Failed => ("!", format!("Couldn't load {noun}")),
+                    ExtraState::Ready => ("/", format!("No {noun} found")),
+                    ExtraState::Idle => ("/", "Search for something".to_string()),
+                };
+                let hint = if extra_state == ExtraState::Failed {
+                    "Spotify refused the request; try again in a moment"
+                } else {
+                    ""
+                };
+                empty_state(frame, theme, list_area, g, &m, hint);
+                (Rect::default(), 0)
+            } else {
+                let cursor = app.search_cursor_of(category);
+                let (heads, row): ([&str; 3], Box<dyn Fn(usize) -> (String, String, String) + '_>) = match category {
+                    SearchCategory::Artists => (
+                        ["NAME", "", "FOLLOWERS"],
+                        Box::new(|i| {
+                            let a = &app.search_artists[i];
+                            (
+                                a.name.clone(),
+                                String::new(),
+                                a.followers.map(compact_count).unwrap_or_default(),
+                            )
+                        }),
+                    ),
+                    SearchCategory::Albums => (
+                        ["ALBUM", "ARTIST", "YEAR · TRACKS"],
+                        Box::new(|i| {
+                            let a = &app.search_albums[i];
+                            let tail = match (a.year.is_empty(), a.track_count) {
+                                (true, 0) => String::new(),
+                                (true, n) => format!("{n} tracks"),
+                                (false, 0) => a.year.clone(),
+                                (false, n) => format!("{} · {n}", a.year),
+                            };
+                            (a.name.clone(), a.artists.clone(), tail)
+                        }),
+                    ),
+                    _ => (
+                        ["PLAYLIST", "OWNER", "TRACKS"],
+                        Box::new(|i| {
+                            let p = &app.search_playlists[i];
+                            let count = if p.track_count > 0 { p.track_count.to_string() } else { String::new() };
+                            (p.name.clone(), p.owner.clone(), count)
+                        }),
+                    ),
+                };
+                list_table(
+                    frame,
+                    theme,
+                    list_area,
+                    len,
+                    cursor,
+                    prev.results_offset,
+                    results_focused,
+                    heads,
+                    &*row,
+                )
+            }
+        }
+    };
     app.zones.results = items;
     app.zones.results_offset = offset;
+}
+
+/// "Tracks 30 · Artists 20 ..." with the active category marked; fills the
+/// click zones of each label.
+fn draw_search_tabs(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect, focused: bool) {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x;
+    for category in SearchCategory::ALL {
+        let count = match category {
+            SearchCategory::Tracks => {
+                let more = if app.search_more != MoreTracks::None { "+" } else { "" };
+                if app.search_loading && app.search_results.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}{more}", app.search_results.len())
+                }
+            }
+            _ => match app.search_extra {
+                ExtraState::Loading | ExtraState::Idle => String::new(),
+                ExtraState::Failed => " –".to_string(),
+                ExtraState::Ready => format!(" {}", app.search_len(category)),
+            },
+        };
+        let label = format!("{}{count}", category.label());
+        let active = category == app.search_category;
+        let style = if active && focused {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else if active {
+            theme.text().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            theme.muted_text()
+        };
+        let width = label.width() as u16;
+        let rect = Rect { x, y: area.y, width, height: 1 }.intersection(area);
+        app.zones.search_tabs[category.index()] = rect;
+        spans.push(Span::styled(label, style));
+        x = x.saturating_add(width);
+        if category != SearchCategory::Playlists {
+            spans.push(Span::styled(" · ", theme.dim_text()));
+            x = x.saturating_add(3);
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// 1200 -> "1.2K", 3_400_000 -> "3.4M".
+fn compact_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}K", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// A three-column list (name, secondary, right-aligned detail) with a header
+/// and divider, like `track_table`. Builds only the visible rows. Returns the
+/// item rows rect and the scroll offset.
+#[allow(clippy::too_many_arguments)]
+fn list_table(
+    frame: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    len: usize,
+    cursor: usize,
+    prev_offset: usize,
+    focused: bool,
+    heads: [&str; 3],
+    row: &dyn Fn(usize) -> (String, String, String),
+) -> (Rect, usize) {
+    if area.height < 3 || len == 0 {
+        return (Rect::default(), 0);
+    }
+    let [header, divider, items] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Fill(1),
+        Constraint::Percentage(30),
+        Constraint::Length(16),
+    ];
+    let col_rects = Layout::horizontal(widths).spacing(1).split(items);
+    let (name_w, sub_w, right_w) = (
+        col_rects[1].width as usize,
+        col_rects[2].width as usize,
+        col_rects[3].width as usize,
+    );
+    let head = Row::new([
+        Cell::from("   #"),
+        Cell::from(heads[0].to_string()),
+        Cell::from(heads[1].to_string()),
+        Cell::from(Line::from(heads[2].to_string()).right_aligned()),
+    ])
+    .style(theme.dim_text());
+    frame.render_widget(Table::new(Vec::<Row>::new(), widths).header(head).column_spacing(1), header);
+    frame.render_widget(
+        Paragraph::new(Span::styled("─".repeat(divider.width as usize), theme.dim_text())),
+        divider,
+    );
+
+    let height = items.height as usize;
+    let offset = window(prev_offset, cursor, len, height);
+    let cursor = cursor.min(len - 1);
+    let bar_style = if focused {
+        Style::default().fg(theme.accent)
+    } else {
+        theme.dim_text()
+    };
+    let rows: Vec<Row> = (offset..len.min(offset + height))
+        .map(|i| {
+            let selected = i == cursor;
+            let (name, sub, right) = row(i);
+            let line = Row::new([
+                Cell::from(Line::from(vec![
+                    Span::styled(if selected { "▌" } else { " " }, bar_style),
+                    Span::styled(format!("{:>3}", i + 1), theme.dim_text()),
+                ])),
+                Cell::from(Span::styled(truncate(&name, name_w).into_owned(), theme.text())),
+                Cell::from(Span::styled(truncate(&sub, sub_w).into_owned(), theme.muted_text())),
+                Cell::from(
+                    Line::from(Span::styled(truncate(&right, right_w).into_owned(), theme.dim_text()))
+                        .right_aligned(),
+                ),
+            ]);
+            if selected {
+                line.style(theme.selected(focused))
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Table::new(rows, widths).column_spacing(1), items);
+    draw_scrollbar(frame, theme, items, len, offset);
+    (items, offset)
+}
+
+/// The centered "add to playlist" overlay.
+fn draw_add_to(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let Some(picker) = app.add_to.as_ref() else {
+        return;
+    };
+    let candidates = app.writable_playlists(&picker.filter);
+    let width = area.width.saturating_sub(4).min(60);
+    let height = (candidates.len() as u16 + 6).min(area.height.saturating_sub(2)).min(20);
+    if width < 24 || height < 7 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .style(Style::default().bg(theme.surface_raised))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let [title, subtitle, filter, list, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let w = inner.width as usize;
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "ADD TO PLAYLIST",
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )),
+        title,
+    );
+    let what = format!("{} — {}", picker.track.name, picker.track.artists);
+    frame.render_widget(
+        Paragraph::new(Span::styled(truncate(&what, w).into_owned(), theme.muted_text())),
+        subtitle,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("/ ", Style::default().fg(theme.accent)),
+            Span::styled(tail(&picker.filter, w.saturating_sub(4)).to_string(), theme.text()),
+            Span::styled("▍", Style::default().fg(theme.accent)),
+        ])),
+        filter,
+    );
+    if candidates.is_empty() {
+        let msg = if app.playlists.is_empty() {
+            "Playlists are still loading"
+        } else {
+            "No playlists you can edit match"
+        };
+        empty_state(frame, theme, list, "", msg, "");
+    } else {
+        let height = list.height as usize;
+        let cursor = picker.cursor.min(candidates.len() - 1);
+        let offset = window(0, cursor, candidates.len(), height);
+        let items: Vec<ListItem> = (offset..candidates.len().min(offset + height))
+            .map(|row| {
+                let playlist = &app.playlists[candidates[row]];
+                let selected = row == cursor;
+                let count = if playlist.track_count > 0 {
+                    playlist.track_count.to_string()
+                } else {
+                    String::new()
+                };
+                let avail = w.saturating_sub(2);
+                let name = truncate(&playlist.name, avail.saturating_sub(count.width() + 1)).into_owned();
+                let pad = avail.saturating_sub(name.width() + count.width());
+                let mut item = ListItem::new(Line::from(vec![
+                    Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(theme.accent)),
+                    Span::styled(name, theme.text()),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(count, theme.dim_text()),
+                ]));
+                if selected {
+                    item = item.style(theme.selected(true));
+                }
+                item
+            })
+            .collect();
+        frame.render_widget(List::new(items), list);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("enter", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            Span::styled(" add   ", theme.muted_text()),
+            Span::styled("↑↓", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            Span::styled(" select   ", theme.muted_text()),
+            Span::styled("esc", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel", theme.muted_text()),
+        ])),
+        footer,
+    );
 }
 
 /// The last `max` columns of `s`, so a long query keeps its cursor in view.
@@ -1019,6 +1397,8 @@ mod tests {
                 uri: format!("spotify:playlist:{i}"),
                 name: format!("Playlist {i}"),
                 owner: "me".into(),
+                owner_id: "me".into(),
+                collaborative: false,
                 track_count: i as u64,
             })
             .collect();
@@ -1085,6 +1465,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn search_tab_draws_categories_focus_and_overlay() {
+        for focus in [SearchFocus::Input, SearchFocus::Results] {
+            for category in SearchCategory::ALL {
+                for state in [ExtraState::Idle, ExtraState::Loading, ExtraState::Ready, ExtraState::Failed] {
+                    let mut app = app();
+                    app.tab = Tab::Search;
+                    app.search_focus = focus;
+                    app.search_category = category;
+                    app.search_extra = state;
+                    app.searched_for = "x".into();
+                    app.search_more = MoreTracks::Web(5);
+                    app.search_more_loading = true;
+                    app.search_artists = vec![crate::models::Artist { name: "Band".into(), followers: Some(1_500_000), ..Default::default() }];
+                    app.search_albums = vec![crate::models::Album { name: "LP".into(), year: "2020".into(), track_count: 9, ..Default::default() }];
+                    app.search_playlists = vec![crate::models::Playlist { name: "Mix".into(), ..Default::default() }];
+                    for (w, h) in [(100, 30), (40, 12), (20, 5)] {
+                        render(&mut app, w, h);
+                    }
+                    app.add_to = Some(crate::app::PlaylistPicker {
+                        track: track(1),
+                        cursor: 3,
+                        filter: String::new(),
+                    });
+                    app.me_id = Some("me".into());
+                    for (w, h) in [(100, 30), (40, 12), (20, 5)] {
+                        render(&mut app, w, h);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_cursor_only_shows_while_typing() {
+        let text = |app: &mut App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+        };
+        let mut app = app();
+        app.tab = Tab::Search;
+        app.search_focus = SearchFocus::Input;
+        assert!(text(&mut app).contains('▍'));
+        app.search_focus = SearchFocus::Results;
+        assert!(!text(&mut app).contains('▍'));
+        assert!(app.zones.search_tabs.iter().all(|r| r.width > 0));
     }
 
     #[test]

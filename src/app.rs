@@ -17,7 +17,7 @@ use tokio::runtime::Handle;
 use crate::api::Client;
 use crate::player::LocalPlayer;
 use crate::theme::Theme;
-use crate::models::{Device, Playback, Playlist, Track};
+use crate::models::{Album, Artist, Device, Playback, Playlist, Track, User};
 
 /// Redraw cadence while something on screen changes with time.
 const ANIM_TICK: Duration = Duration::from_millis(250);
@@ -34,8 +34,14 @@ pub const STATUS_TTL: Duration = Duration::from_secs(4);
 
 /// How many liked tracks are loaded.
 const LIBRARY_LIMIT: u32 = 200;
-/// How many search results are fetched.
+/// How many search results are fetched (per page).
 const SEARCH_LIMIT: u32 = 30;
+/// How many artists, albums and playlists each are requested.
+const SEARCH_EXTRA_LIMIT: u32 = 20;
+/// Quiet time after the last keystroke before searching as you type.
+pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
+/// Shortest trimmed query that searches by itself.
+pub const SEARCH_MIN_CHARS: usize = 2;
 
 /// The key of the built-in liked-tracks list in the library view.
 pub const LIKED_KEY: &str = "liked";
@@ -55,6 +61,96 @@ pub enum LyricsState {
     Missing,
     /// `App::view_lyrics` holds the lyrics.
     Ready,
+}
+
+/// Where typing goes on the Search tab.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum SearchFocus {
+    /// Keys edit the query.
+    #[default]
+    Input,
+    /// Keys are shortcuts on the selected result.
+    Results,
+}
+
+/// The result groups shown as tabs inside the results panel.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum SearchCategory {
+    #[default]
+    Tracks,
+    Artists,
+    Albums,
+    Playlists,
+}
+
+impl SearchCategory {
+    pub const ALL: [SearchCategory; 4] = [
+        SearchCategory::Tracks,
+        SearchCategory::Artists,
+        SearchCategory::Albums,
+        SearchCategory::Playlists,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchCategory::Tracks => "Tracks",
+            SearchCategory::Artists => "Artists",
+            SearchCategory::Albums => "Albums",
+            SearchCategory::Playlists => "Playlists",
+        }
+    }
+
+    fn shifted(self, delta: i32) -> Self {
+        Self::ALL[wrap(self.index() as i64 + delta as i64, 4) as usize]
+    }
+}
+
+/// Where the lists of artists, albums and playlists stand.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ExtraState {
+    /// No search has asked yet.
+    #[default]
+    Idle,
+    Loading,
+    Ready,
+    /// The Web API refused or was unreachable (503, 429, ...).
+    Failed,
+}
+
+/// Where the next page of track results comes from.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+pub enum MoreTracks {
+    /// Everything was loaded.
+    #[default]
+    None,
+    /// Session search: the track uris not resolved yet, in match order.
+    Session(Vec<String>),
+    /// Web API search: the offset of the next page.
+    Web(u32),
+}
+
+/// One page of track results.
+pub struct SearchPage {
+    pub tracks: Vec<Track>,
+    pub more: MoreTracks,
+}
+
+/// Artists, albums and playlists matching a query.
+pub struct SearchExtras {
+    pub artists: Vec<Artist>,
+    pub albums: Vec<Album>,
+    pub playlists: Vec<Playlist>,
+}
+
+/// The "add to playlist" overlay.
+pub struct PlaylistPicker {
+    pub track: Track,
+    pub cursor: usize,
+    pub filter: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,6 +173,10 @@ pub struct MouseZones {
     pub tracks: ratatui::layout::Rect,
     /// The search result list items.
     pub results: ratatui::layout::Rect,
+    /// The search input field.
+    pub search_input: ratatui::layout::Rect,
+    /// The category tabs of the search results, in `SearchCategory::ALL` order.
+    pub search_tabs: [ratatui::layout::Rect; 4],
     /// The view tab artist-track list items.
     pub view: ratatui::layout::Rect,
     /// Rows the playlist/tracks list skips before the first entry.
@@ -103,7 +203,17 @@ pub enum AppEvent {
     Playback(Result<Option<Playback>>),
     Playlists(Result<Vec<Playlist>>),
     Tracks { key: String, tracks: Vec<Track> },
-    SearchResults { seq: u64, tracks: Vec<Track> },
+    SearchResults { seq: u64, outcome: Result<SearchPage> },
+    /// The next page of track results.
+    SearchMore { seq: u64, outcome: Result<SearchPage> },
+    /// Artists, albums and playlists for the search.
+    SearchExtra { seq: u64, outcome: Result<SearchExtras> },
+    /// The signed-in user's profile (for playlist ownership).
+    Me(Result<User>),
+    /// A like (save to Liked Songs) finished.
+    LikeResult { uri: String, outcome: Result<()> },
+    /// A track was (or was not) added to a playlist.
+    PlaylistAdded { playlist_id: String, name: String, outcome: Result<()> },
     Devices(Vec<Device>),
     Done { action: &'static str, outcome: Result<()> },
     /// The built-in player finished starting up.
@@ -169,10 +279,33 @@ pub struct App {
     pub(crate) tracks_cursor: usize,
     pub(crate) tracks_key: Option<String>,
     pub(crate) tracks_focused: bool,
+    /// Heading of the tracks pane when it shows something other than a
+    /// library playlist (an album or artist opened from search).
+    pub(crate) tracks_title: Option<String>,
 
     pub(crate) search_input: String,
     pub(crate) search_results: Vec<Track>,
     pub(crate) search_cursor: usize,
+    pub(crate) search_focus: SearchFocus,
+    pub(crate) search_category: SearchCategory,
+    pub(crate) search_artists: Vec<Artist>,
+    pub(crate) search_albums: Vec<Album>,
+    pub(crate) search_playlists: Vec<Playlist>,
+    /// Cursors of the artists, albums and playlists lists.
+    pub(crate) search_extra_cursors: [usize; 3],
+    pub(crate) search_extra: ExtraState,
+    /// The track search is in flight.
+    pub(crate) search_loading: bool,
+    /// More track results exist beyond `search_results`.
+    pub(crate) search_more: MoreTracks,
+    pub(crate) search_more_loading: bool,
+    /// When the search-as-you-type debounce fires.
+    pub(crate) search_debounce: Option<Instant>,
+    /// The "add to playlist" overlay, while open.
+    pub(crate) add_to: Option<PlaylistPicker>,
+    /// The signed-in user's id, to tell owned playlists from followed ones.
+    pub(crate) me_id: Option<String>,
+    me_in_flight: bool,
 
     pub(crate) playback: Option<Playback>,
     pub(crate) playback_at: Option<Instant>,
@@ -254,9 +387,24 @@ impl App {
             tracks_cursor: 0,
             tracks_key: None,
             tracks_focused: false,
+            tracks_title: None,
             search_input: String::new(),
             search_results: Vec::new(),
             search_cursor: 0,
+            search_focus: SearchFocus::Input,
+            search_category: SearchCategory::Tracks,
+            search_artists: Vec::new(),
+            search_albums: Vec::new(),
+            search_playlists: Vec::new(),
+            search_extra_cursors: [0; 3],
+            search_extra: ExtraState::Idle,
+            search_loading: false,
+            search_more: MoreTracks::None,
+            search_more_loading: false,
+            search_debounce: None,
+            add_to: None,
+            me_id: None,
+            me_in_flight: false,
             playback: None,
             playback_at: None,
             devices: Vec::new(),
@@ -320,6 +468,10 @@ impl App {
                 let due = self.poll_interval().saturating_sub(last_poll.elapsed());
                 timeout = timeout.min(due.max(Duration::from_millis(1)));
             }
+            // Wake when the search-as-you-type debounce is due, no keypress needed.
+            if let Some(left) = self.search_debounce_left(Instant::now()) {
+                timeout = timeout.min(left.max(Duration::from_millis(1)));
+            }
             // Wake exactly when the status message expires instead of ticking.
             if let Some((_, expires)) = self.status.as_ref() {
                 let left = expires.saturating_duration_since(Instant::now());
@@ -349,6 +501,11 @@ impl App {
                 if jobs.local.is_none() {
                     jobs.local = self.local.clone();
                 }
+                dirty = true;
+            }
+
+            if self.take_due_search(Instant::now()) {
+                self.submit_search(&jobs);
                 dirty = true;
             }
 
@@ -389,6 +546,7 @@ impl App {
     fn bootstrap(&mut self, jobs: &Jobs) {
         self.refresh_playlists(jobs);
         self.refresh_devices(jobs);
+        self.fetch_me(jobs);
         // Songs visible without a second click: liked tracks load on start.
         self.load_tracks(jobs, LIKED_KEY);
         self.tracks_focused = true;
@@ -463,11 +621,17 @@ impl App {
     }
 
     fn load_tracks(&mut self, jobs: &Jobs, key: &str) {
-        self.pending += 1;
         self.tracks_key = Some(key.to_string());
+        self.tracks_title = None;
         // Never show the previous list under the new title.
         self.tracks.clear();
         self.tracks_cursor = 0;
+        self.fetch_tracks(jobs, key);
+    }
+
+    /// Fetch the list for `key` into the tracks pane without clearing it first.
+    fn fetch_tracks(&mut self, jobs: &Jobs, key: &str) {
+        self.pending += 1;
         let client = jobs.client.clone();
         let local = jobs.local.clone();
         let key = key.to_string();
@@ -478,6 +642,9 @@ impl App {
                         .saved_tracks(LIBRARY_LIMIT)
                         .await
                         .map_err(anyhow::Error::from),
+                    (k, _) if k.starts_with("album:") || k.starts_with("artist:") => {
+                        catalog_tracks(&client, local.as_ref(), k).await
+                    }
                     (_, Some(local)) => {
                         crate::library::playlist_tracks(&local.session(), &key, LIBRARY_LIMIT as usize).await
                     }
@@ -501,50 +668,435 @@ impl App {
         );
     }
 
+    /// Show `key` (a playlist id, `album:<id>` or `artist:<id>`) in the
+    /// Library tab's tracks pane under `title`.
+    fn open_catalog(&mut self, jobs: &Jobs, key: String, title: String) {
+        if key.ends_with(':') || key.is_empty() {
+            self.say("That result has no id to open");
+            return;
+        }
+        self.tab = Tab::Library;
+        self.tracks_focused = true;
+        self.local_playlist_play = None;
+        self.load_tracks(jobs, &key);
+        self.tracks_title = Some(title.clone());
+        self.say(format!("Opening {title}..."));
+    }
+
+    // --- Search -------------------------------------------------------------------
+
+    /// Time left before the debounced search is due, if one is armed.
+    pub(crate) fn search_debounce_left(&self, now: Instant) -> Option<Duration> {
+        self.search_debounce.map(|at| at.saturating_duration_since(now))
+    }
+
+    /// Re-arm (or disarm) the search-as-you-type debounce after an edit.
+    fn arm_search_debounce(&mut self, now: Instant) {
+        self.search_debounce =
+            wants_search(&self.search_input, &self.searched_for).then(|| now + SEARCH_DEBOUNCE);
+    }
+
+    /// Whether the debounce elapsed and a search should start now; disarms it.
+    pub(crate) fn take_due_search(&mut self, now: Instant) -> bool {
+        match self.search_debounce {
+            Some(at) if now >= at => {
+                self.search_debounce = None;
+                wants_search(&self.search_input, &self.searched_for)
+            }
+            _ => false,
+        }
+    }
+
     fn submit_search(&mut self, jobs: &Jobs) {
         let query = self.search_input.trim().to_string();
         if query.is_empty() {
             return;
         }
+        self.search_debounce = None;
         self.searched_for = query.clone();
-        self.pending += 1;
+        self.pending += 2;
         self.search_seq += 1;
+        self.search_loading = true;
+        self.search_more_loading = false;
+        self.search_extra = ExtraState::Loading;
         let seq = self.search_seq;
+
         let client = jobs.client.clone();
         let local = jobs.local.clone();
+        let tracks_query = query.clone();
+        jobs.submit(
+            async move { search_tracks_job(&client, local.as_ref(), &tracks_query).await },
+            move |outcome| AppEvent::SearchResults { seq, outcome },
+        );
+
+        // Artists, albums and playlists exist only in the Web API's search;
+        // the session's search context carries tracks alone.
+        let client = jobs.client.clone();
         jobs.submit(
             async move {
-                // The session search has no per-app quota; the Web API's
-                // shared search endpoint answers 503 under load.
-                match local.as_ref() {
-                    Some(local) => {
-                        crate::library::search(&local.session(), &query, SEARCH_LIMIT as usize).await
-                    }
-                    None => client
-                        .search_tracks(&query, SEARCH_LIMIT)
-                        .await
-                        .map_err(anyhow::Error::from),
-                }
+                let (artists, albums, playlists) = client
+                    .search_extras(&query, SEARCH_EXTRA_LIMIT)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                Ok(SearchExtras { artists, albums, playlists })
             },
-            move |result| match result {
-                Ok(tracks) => AppEvent::SearchResults { seq, tracks },
-                Err(e) => AppEvent::Done {
-                    action: "search",
-                    outcome: Err(e),
-                },
-            },
+            move |outcome| AppEvent::SearchExtra { seq, outcome },
         );
     }
 
+    /// Fetch the next page of track results (no-op when none or in flight).
+    fn load_more_tracks(&mut self, jobs: &Jobs) {
+        if self.search_more_loading {
+            return;
+        }
+        let more = self.search_more.clone();
+        if more == MoreTracks::None {
+            return;
+        }
+        self.search_more_loading = true;
+        self.pending += 1;
+        let seq = self.search_seq;
+        let client = jobs.client.clone();
+        let local = jobs.local.clone();
+        let query = self.searched_for.clone();
+        jobs.submit(
+            async move {
+                match more {
+                    MoreTracks::Session(mut rest) => {
+                        let remainder = rest.split_off(SEARCH_LIMIT.min(rest.len() as u32) as usize);
+                        let local = local.ok_or_else(|| anyhow::anyhow!("the local player is gone"))?;
+                        let tracks = crate::library::resolve_page(&local.session(), rest).await;
+                        let more = if remainder.is_empty() {
+                            MoreTracks::None
+                        } else {
+                            MoreTracks::Session(remainder)
+                        };
+                        Ok(SearchPage { tracks, more })
+                    }
+                    MoreTracks::Web(offset) => {
+                        let (tracks, next) = client
+                            .search_tracks_page(&query, SEARCH_LIMIT, offset)
+                            .await
+                            .map_err(anyhow::Error::from)?;
+                        Ok(SearchPage { tracks, more: next.map_or(MoreTracks::None, MoreTracks::Web) })
+                    }
+                    MoreTracks::None => Ok(SearchPage { tracks: Vec::new(), more: MoreTracks::None }),
+                }
+            },
+            move |outcome| AppEvent::SearchMore { seq, outcome },
+        );
+    }
+
+    fn fetch_me(&mut self, jobs: &Jobs) {
+        if self.me_in_flight || self.me_id.is_some() {
+            return;
+        }
+        self.me_in_flight = true;
+        self.pending += 1;
+        let client = jobs.client.clone();
+        jobs.submit(async move { client.me().await.map_err(anyhow::Error::from) }, AppEvent::Me);
+    }
+
+    pub(crate) fn search_len(&self, category: SearchCategory) -> usize {
+        match category {
+            SearchCategory::Tracks => self.search_results.len(),
+            SearchCategory::Artists => self.search_artists.len(),
+            SearchCategory::Albums => self.search_albums.len(),
+            SearchCategory::Playlists => self.search_playlists.len(),
+        }
+    }
+
+    pub(crate) fn search_cursor_of(&self, category: SearchCategory) -> usize {
+        match category {
+            SearchCategory::Tracks => self.search_cursor,
+            other => self.search_extra_cursors[other.index() - 1],
+        }
+    }
+
+    fn set_search_cursor(&mut self, category: SearchCategory, value: usize) {
+        match category {
+            SearchCategory::Tracks => self.search_cursor = value,
+            other => self.search_extra_cursors[other.index() - 1] = value,
+        }
+    }
+
+    fn focus_search_results_or_keep(&mut self) {
+        if self.has_any_results() {
+            self.search_focus = SearchFocus::Results;
+        }
+    }
+
+    fn has_any_results(&self) -> bool {
+        SearchCategory::ALL.iter().any(|c| self.search_len(*c) > 0)
+    }
+
+    fn focus_search_results(&mut self) {
+        if !self.has_any_results() {
+            return;
+        }
+        self.search_focus = SearchFocus::Results;
+        // Land on a category that has something when the current one is empty.
+        if self.search_len(self.search_category) == 0 {
+            if let Some(c) = SearchCategory::ALL.iter().find(|c| self.search_len(**c) > 0) {
+                self.search_category = *c;
+            }
+        }
+    }
+
+    /// Move the selection in the active category. Single steps wrap; page
+    /// jumps clamp. Landing on the last track row loads the next page.
+    fn search_move(&mut self, delta: i32, jobs: &Jobs) {
+        let category = self.search_category;
+        let len = self.search_len(category);
+        if len == 0 {
+            return;
+        }
+        let cursor = self.search_cursor_of(category).min(len - 1);
+        let more = category == SearchCategory::Tracks && self.search_more != MoreTracks::None;
+        let next = if delta.abs() > 1 {
+            (cursor as i64 + delta as i64).clamp(0, len as i64 - 1) as usize
+        } else if delta > 0 && cursor + 1 >= len && more {
+            cursor
+        } else {
+            wrap(cursor as i64 + delta as i64, len as i64) as usize
+        };
+        self.set_search_cursor(category, next);
+        if more && next + 1 >= len {
+            self.load_more_tracks(jobs);
+        }
+    }
+
+    fn on_key_search(&mut self, key: KeyEvent, jobs: &Jobs) {
+        match self.search_focus {
+            SearchFocus::Input => self.on_key_search_input(key, jobs),
+            SearchFocus::Results => self.on_key_search_results(key, jobs),
+        }
+    }
+
+    fn on_key_search_input(&mut self, key: KeyEvent, jobs: &Jobs) {
+        match key.code {
+            KeyCode::Char('q') if self.search_input.is_empty() => self.should_quit = true,
+            KeyCode::Tab => self.tab = Tab::View,
+            KeyCode::Esc => {
+                self.search_input.clear();
+                self.search_debounce = None;
+            }
+            // A new query searches at once; on the results of the current
+            // one, Enter hands the keyboard to them.
+            KeyCode::Enter => {
+                if self.has_any_results() && self.search_input.trim() == self.searched_for {
+                    self.focus_search_results();
+                } else {
+                    self.submit_search(jobs);
+                }
+            }
+            KeyCode::Down => self.focus_search_results(),
+            KeyCode::Backspace => {
+                self.search_input.pop();
+                self.arm_search_debounce(Instant::now());
+            }
+            // Every printable key goes into the input here.
+            KeyCode::Char(c) => {
+                self.search_input.push(c);
+                self.arm_search_debounce(Instant::now());
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_search_results(&mut self, key: KeyEvent, jobs: &Jobs) {
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Tab => self.tab = Tab::View,
+            KeyCode::Esc | KeyCode::Char('/') | KeyCode::Char('i') => {
+                self.search_focus = SearchFocus::Input;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.search_move(-1, jobs),
+            KeyCode::Down | KeyCode::Char('j') => self.search_move(1, jobs),
+            KeyCode::PageUp => self.search_move(-10, jobs),
+            KeyCode::PageDown => self.search_move(10, jobs),
+            KeyCode::Left => self.search_category = self.search_category.shifted(-1),
+            KeyCode::Right => self.search_category = self.search_category.shifted(1),
+            KeyCode::Char(c @ '1'..='4') => {
+                self.search_category = SearchCategory::ALL[(c as u8 - b'1') as usize];
+            }
+            KeyCode::Enter => self.activate_search_selection(jobs),
+            KeyCode::Char('a') => self.queue_selection(jobs),
+            KeyCode::Char('l') => self.like_selection(jobs),
+            KeyCode::Char('p') => self.open_add_to_playlist(jobs),
+            KeyCode::Char(' ') => self.toggle_playback(jobs),
+            KeyCode::Char('n') => self.skip(jobs, true),
+            KeyCode::Char(',') => self.seek(jobs, -5000),
+            KeyCode::Char('.') => self.seek(jobs, 5000),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.change_volume(jobs, 5),
+            KeyCode::Char('-') => self.change_volume(jobs, -5),
+            KeyCode::Char('s') => self.toggle_shuffle(jobs),
+            KeyCode::Char('r') => self.cycle_repeat(jobs),
+            KeyCode::Char('t') => self.toggle_source(jobs),
+            _ => {}
+        }
+    }
+
+    /// Enter on the selected search result: play a track, open anything else
+    /// in the Library tab's tracks pane.
+    fn activate_search_selection(&mut self, jobs: &Jobs) {
+        let category = self.search_category;
+        let index = self.search_cursor_of(category);
+        match category {
+            SearchCategory::Tracks => self.play_selection(jobs),
+            SearchCategory::Artists => {
+                if let Some(artist) = self.search_artists.get(index).cloned() {
+                    self.open_catalog(jobs, format!("artist:{}", artist.id), artist.name);
+                }
+            }
+            SearchCategory::Albums => {
+                if let Some(album) = self.search_albums.get(index).cloned() {
+                    self.open_catalog(jobs, format!("album:{}", album.id), album.name);
+                }
+            }
+            SearchCategory::Playlists => {
+                if let Some(playlist) = self.search_playlists.get(index).cloned() {
+                    self.open_catalog(jobs, playlist.id, playlist.name);
+                }
+            }
+        }
+    }
+
+    /// Save the selected track to Liked Songs, optimistically.
+    fn like_selection(&mut self, jobs: &Jobs) {
+        let Some(track) = self.selected_track() else {
+            self.say("Select a track to like it");
+            return;
+        };
+        let id = track_id(&track);
+        if id.is_empty() {
+            return;
+        }
+        self.say(format!("Liked {}", track.name));
+        if self.tracks_key.as_deref() == Some(LIKED_KEY)
+            && !self.tracks.is_empty()
+            && !self.tracks.iter().any(|t| t.uri == track.uri)
+        {
+            self.tracks.insert(0, track.clone());
+            self.tracks_cursor += 1;
+        }
+        self.pending += 1;
+        let client = jobs.client.clone();
+        let uri = track.uri.clone();
+        jobs.submit(
+            async move { client.save_tracks(&[id]).await.map_err(|e| e.into_write_error()) },
+            move |outcome| AppEvent::LikeResult { uri, outcome },
+        );
+    }
+
+    /// Open the playlist picker for the selected track.
+    fn open_add_to_playlist(&mut self, jobs: &Jobs) {
+        let Some(track) = self.selected_track() else {
+            self.say("Select a track to add it to a playlist");
+            return;
+        };
+        self.fetch_me(jobs);
+        self.add_to = Some(PlaylistPicker { track, cursor: 0, filter: String::new() });
+    }
+
+    /// Indices into `playlists` the user may add to (owned or collaborative)
+    /// whose name contains `filter`.
+    pub(crate) fn writable_playlists(&self, filter: &str) -> Vec<usize> {
+        let needle = filter.trim().to_lowercase();
+        self.playlists
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.collaborative
+                    // Until the profile arrives, offer everything.
+                    || self.me_id.as_deref().is_none_or(|me| p.owner_id == me)
+            })
+            .filter(|(_, p)| needle.is_empty() || p.name.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn on_key_add_to(&mut self, key: KeyEvent, jobs: &Jobs) {
+        let Some(picker) = self.add_to.as_ref() else {
+            return;
+        };
+        let candidates = self.writable_playlists(&picker.filter);
+        match key.code {
+            KeyCode::Esc => self.add_to = None,
+            KeyCode::Up | KeyCode::Down => {
+                if candidates.is_empty() {
+                    return;
+                }
+                let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                if let Some(picker) = self.add_to.as_mut() {
+                    picker.cursor =
+                        wrap(picker.cursor as i64 + delta, candidates.len() as i64) as usize;
+                }
+            }
+            KeyCode::Enter => {
+                let Some(picker) = self.add_to.take() else {
+                    return;
+                };
+                let Some(&index) = candidates.get(picker.cursor.min(candidates.len().saturating_sub(1)))
+                else {
+                    self.add_to = Some(picker);
+                    return;
+                };
+                let playlist = self.playlists[index].clone();
+                self.say(format!("Adding to {}...", playlist.name));
+                self.pending += 1;
+                let client = jobs.client.clone();
+                let uri = picker.track.uri;
+                let (playlist_id, name) = (playlist.id.clone(), playlist.name.clone());
+                jobs.submit(
+                    async move {
+                        client.playlist_add(&playlist.id, &[uri]).await.map_err(|e| e.into_write_error())
+                    },
+                    move |outcome| AppEvent::PlaylistAdded { playlist_id, name, outcome },
+                );
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = self.add_to.as_mut() {
+                    picker.filter.pop();
+                    picker.cursor = 0;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(picker) = self.add_to.as_mut() {
+                    picker.filter.push(c);
+                    picker.cursor = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
     // --- Keys ------------------------------------------------------------------
+
+    /// Switch to the next named theme and remember it for the next start.
+    fn cycle_theme(&mut self) {
+        self.theme = self.theme.next();
+        let name = self.theme.name;
+        let saved = crate::config_dir().and_then(|dir| {
+            let mut settings = crate::settings::load(&dir);
+            settings.theme = Some(name.to_string());
+            crate::settings::save(&dir, &settings)
+        });
+        match saved {
+            Ok(()) => self.say(format!("Theme: {name}")),
+            Err(e) => self.say(format!("Theme: {name} (not saved: {e})")),
+        }
+    }
 
     fn on_key(&mut self, key: KeyEvent, jobs: &Jobs) {
         // AltGr arrives as CONTROL|ALT on Windows and types a character.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
-            if key.code == KeyCode::Char('c') {
-                self.should_quit = true;
+            match key.code {
+                KeyCode::Char('c') => self.should_quit = true,
+                KeyCode::Char('t') => self.cycle_theme(),
+                _ => {}
             }
             return;
         }
@@ -558,6 +1110,10 @@ impl App {
                 MediaKeyCode::TrackPrevious | MediaKeyCode::Rewind => self.skip(jobs, false),
                 _ => {}
             }
+            return;
+        }
+        if self.add_to.is_some() {
+            self.on_key_add_to(key, jobs);
             return;
         }
         match self.tab {
@@ -646,7 +1202,9 @@ impl App {
             Tab::Library if self.tracks_focused => {
                 Some((self.tracks.clone(), self.tracks_cursor))
             }
-            Tab::Search => Some((self.search_results.clone(), self.search_cursor)),
+            Tab::Search if self.search_category == SearchCategory::Tracks => {
+                Some((self.search_results.clone(), self.search_cursor))
+            }
             _ => None,
         }
     }
@@ -892,41 +1450,6 @@ impl App {
         }
     }
 
-    fn on_key_search(&mut self, key: KeyEvent, jobs: &Jobs) {
-        match key.code {
-            KeyCode::Char('q') if self.search_input.is_empty() => self.should_quit = true,
-            KeyCode::Tab => self.tab = Tab::View,
-            KeyCode::Esc => {
-                self.search_input.clear();
-                self.search_cursor = 0;
-            }
-            // A new query searches; on the results of the current one, Enter
-            // plays the selected track.
-            KeyCode::Enter => {
-                if !self.search_results.is_empty()
-                    && self.search_input.trim() == self.searched_for
-                {
-                    self.play_selection(jobs);
-                } else {
-                    self.submit_search(jobs);
-                }
-            }
-            KeyCode::Backspace => {
-                self.search_input.pop();
-                self.search_cursor = 0;
-            }
-            KeyCode::Up => self.move_cursor(-1),
-            KeyCode::Down => self.move_cursor(1),
-            // Every printable key goes into the input here; playback keys
-            // live in the Library tab.
-            KeyCode::Char(c) => {
-                self.search_input.push(c);
-                self.search_cursor = 0;
-            }
-            _ => {}
-        }
-    }
-
     /// Move the focused list's cursor by `delta`, wrapping at the ends.
     fn move_cursor(&mut self, delta: i32) {
         let (cursor, len) = match self.tab {
@@ -939,7 +1462,8 @@ impl App {
                     (&mut self.playlists_cursor, self.playlists.len() + 1)
                 }
             }
-            Tab::Search => (&mut self.search_cursor, self.search_results.len()),
+            // The search lists move through `search_move`.
+            Tab::Search => return,
         };
         if len == 0 {
             return;
@@ -952,7 +1476,9 @@ impl App {
     fn selected_track(&self) -> Option<Track> {
         match self.tab {
             Tab::Library if self.tracks_focused => self.tracks.get(self.tracks_cursor).cloned(),
-            Tab::Search => self.search_results.get(self.search_cursor).cloned(),
+            Tab::Search if self.search_category == SearchCategory::Tracks => {
+                self.search_results.get(self.search_cursor).cloned()
+            }
             _ => None,
         }
     }
@@ -1223,13 +1749,21 @@ impl App {
     }
 
     fn queue_selection(&mut self, jobs: &Jobs) {
-        if self.source == Source::Local {
-            self.say("Queueing works on Spotify devices; local playback follows the list");
-            return;
-        }
         let Some(track) = self.selected_track() else {
             return;
         };
+        if self.source == Source::Local {
+            match self.local.clone() {
+                Some(local) => {
+                    // Joins the end of the local queue.
+                    local.extend_queue(vec![track.clone()]);
+                    self.apply_local_snapshot();
+                    self.say(format!("Queued {}", track.name));
+                }
+                None => self.say("The local player is still starting"),
+            }
+            return;
+        }
         self.say(format!("Queued {}", track.name));
         let uri = track.uri.clone();
         let client = jobs.client.clone();
@@ -1263,6 +1797,8 @@ impl App {
     fn on_mouse(&mut self, mouse: ratatui::crossterm::event::MouseEvent, jobs: &Jobs) {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
         match mouse.kind {
+            MouseEventKind::ScrollUp if self.tab == Tab::Search => self.search_move(-1, jobs),
+            MouseEventKind::ScrollDown if self.tab == Tab::Search => self.search_move(1, jobs),
             MouseEventKind::ScrollUp => self.move_cursor(-1),
             MouseEventKind::ScrollDown => self.move_cursor(1),
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1306,13 +1842,22 @@ impl App {
                         }
                     }
                     Tab::Search => {
-                        if self.zones.results.contains(at) {
+                        if self.zones.search_input.contains(at) {
+                            self.search_focus = SearchFocus::Input;
+                        } else if let Some(i) =
+                            self.zones.search_tabs.iter().position(|r| r.contains(at))
+                        {
+                            self.search_category = SearchCategory::ALL[i];
+                            self.focus_search_results_or_keep();
+                        } else if self.zones.results.contains(at) {
                             let index = row_in(self.zones.results, self.zones.results_offset);
-                            if index >= self.search_results.len() {
+                            let category = self.search_category;
+                            if index >= self.search_len(category) {
                                 return;
                             }
-                            self.search_cursor = index;
-                            self.play_selection(jobs);
+                            self.search_focus = SearchFocus::Results;
+                            self.set_search_cursor(category, index);
+                            self.activate_search_selection(jobs);
                         }
                     }
                     Tab::View => {
@@ -1379,15 +1924,101 @@ impl App {
                     }
                 }
             }
-            AppEvent::SearchResults { seq, tracks } => {
+            AppEvent::SearchResults { seq, outcome } => {
                 self.pending = self.pending.saturating_sub(1);
                 if seq != self.search_seq {
                     return;
                 }
-                let count = tracks.len();
-                self.search_results = tracks;
-                self.search_cursor = 0;
-                self.say(format!("{count} result{}", if count == 1 { "" } else { "s" }));
+                self.search_loading = false;
+                match outcome {
+                    Ok(page) => {
+                        let count = page.tracks.len();
+                        self.search_results = page.tracks;
+                        self.search_more = page.more;
+                        self.search_cursor = 0;
+                        self.say(format!("{count} result{}", if count == 1 { "" } else { "s" }));
+                    }
+                    Err(e) => self.say_error(format!("search: {e}")),
+                }
+            }
+            AppEvent::SearchMore { seq, outcome } => {
+                self.pending = self.pending.saturating_sub(1);
+                if seq != self.search_seq {
+                    return;
+                }
+                self.search_more_loading = false;
+                match outcome {
+                    Ok(page) => {
+                        for track in page.tracks {
+                            if !self.search_results.iter().any(|t| t.uri == track.uri) {
+                                self.search_results.push(track);
+                            }
+                        }
+                        self.search_more = page.more;
+                    }
+                    Err(e) => self.say(format!("Couldn't load more results: {e}")),
+                }
+            }
+            AppEvent::SearchExtra { seq, outcome } => {
+                self.pending = self.pending.saturating_sub(1);
+                if seq != self.search_seq {
+                    return;
+                }
+                match outcome {
+                    Ok(extras) => {
+                        self.search_artists = extras.artists;
+                        self.search_albums = extras.albums;
+                        self.search_playlists = extras.playlists;
+                        self.search_extra = ExtraState::Ready;
+                    }
+                    Err(_) => {
+                        self.search_artists.clear();
+                        self.search_albums.clear();
+                        self.search_playlists.clear();
+                        self.search_extra = ExtraState::Failed;
+                    }
+                }
+                self.search_extra_cursors = [0; 3];
+            }
+            AppEvent::Me(result) => {
+                self.pending = self.pending.saturating_sub(1);
+                self.me_in_flight = false;
+                if let Ok(user) = result {
+                    if !user.id.is_empty() {
+                        self.me_id = Some(user.id);
+                    }
+                }
+            }
+            AppEvent::LikeResult { uri, outcome } => {
+                self.pending = self.pending.saturating_sub(1);
+                if let Err(e) = outcome {
+                    // Take back the optimistic row.
+                    if self.tracks_key.as_deref() == Some(LIKED_KEY)
+                        && self.tracks.first().is_some_and(|t| t.uri == uri)
+                    {
+                        self.tracks.remove(0);
+                        self.tracks_cursor = self.tracks_cursor.saturating_sub(1);
+                    }
+                    self.say_error(format!("Couldn't like: {e}"));
+                }
+            }
+            AppEvent::PlaylistAdded { playlist_id, name, outcome } => {
+                self.pending = self.pending.saturating_sub(1);
+                match outcome {
+                    Ok(()) => {
+                        if let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == playlist_id) {
+                            playlist.track_count += 1;
+                        }
+                        // Opened in the Library tab right now: refetch it so
+                        // the new song shows (loaded lists are not cached, so
+                        // opening it later reads fresh data anyway).
+                        if self.tracks_key.as_deref() == Some(playlist_id.as_str()) {
+                            self.fetch_tracks(jobs, &playlist_id);
+                        }
+                        self.say(format!("Added to {name}"));
+                    }
+                    Err(e) => self.say_error(format!("Couldn't add to {name}: {e}")),
+                }
             }
             AppEvent::Devices(devices) => {
                 self.pending = self.pending.saturating_sub(1);
@@ -1523,6 +2154,72 @@ fn done(action: &'static str) -> impl FnOnce(Result<()>) -> AppEvent {
     move |outcome| AppEvent::Done { action, outcome }
 }
 
+/// Whether a query as typed should search by itself: long enough once
+/// trimmed, and different from what was last searched.
+fn wants_search(input: &str, searched_for: &str) -> bool {
+    let query = input.trim();
+    query.chars().count() >= SEARCH_MIN_CHARS && query != searched_for
+}
+
+/// The Web API id of a track (the last segment of its uri).
+fn track_id(track: &Track) -> String {
+    track.uri.rsplit(':').next().unwrap_or_default().to_string()
+}
+
+/// Track search: the session first (no quota), the Web API as fallback.
+async fn search_tracks_job(
+    client: &Client,
+    local: Option<&LocalPlayer>,
+    query: &str,
+) -> Result<SearchPage> {
+    let mut session_error = None;
+    let mut session_empty = false;
+    if let Some(local) = local {
+        match crate::library::search(&local.session(), query, SEARCH_LIMIT as usize).await {
+            Ok((tracks, rest)) if !tracks.is_empty() => {
+                let more = if rest.is_empty() { MoreTracks::None } else { MoreTracks::Session(rest) };
+                return Ok(SearchPage { tracks, more });
+            }
+            Ok(_) => session_empty = true,
+            Err(e) => session_error = Some(e),
+        }
+    }
+    match client.search_tracks_page(query, SEARCH_LIMIT, 0).await {
+        Ok((tracks, next)) => Ok(SearchPage { tracks, more: next.map_or(MoreTracks::None, MoreTracks::Web) }),
+        Err(_) if session_empty => Ok(SearchPage { tracks: Vec::new(), more: MoreTracks::None }),
+        Err(e) => Err(session_error.unwrap_or_else(|| e.into())),
+    }
+}
+
+/// Tracks of an `album:<id>` or `artist:<id>` key: the session first, the
+/// Web API as fallback.
+async fn catalog_tracks(client: &Client, local: Option<&LocalPlayer>, key: &str) -> Result<Vec<Track>> {
+    let (kind, id) = key.split_once(':').unwrap_or_default();
+    let mut session_error = None;
+    if let Some(local) = local {
+        let session = local.session();
+        let result = match kind {
+            "album" => crate::library::album_tracks(&session, id, LIBRARY_LIMIT as usize).await,
+            _ => crate::library::artist_top_tracks(&session, &format!("spotify:artist:{id}"))
+                .await
+                .map(|(_, tracks)| tracks),
+        };
+        match result {
+            Ok(tracks) if !tracks.is_empty() => return Ok(tracks),
+            Ok(_) => {}
+            Err(e) => session_error = Some(e),
+        }
+    }
+    let web = match kind {
+        "album" => client.album_tracks(id).await,
+        _ => client.artist_top_tracks(id).await,
+    };
+    match web {
+        Ok(tracks) => Ok(tracks),
+        Err(e) => Err(session_error.unwrap_or_else(|| e.into())),
+    }
+}
+
 /// Wrap an index around `len`, in either direction.
 fn wrap(index: i64, len: i64) -> i64 {
     index.rem_euclid(len)
@@ -1531,6 +2228,222 @@ fn wrap(index: i64, len: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runtime plus jobs whose client never gets used: tests only press
+    /// keys that do not touch the network.
+    fn test_jobs() -> (tokio::runtime::Runtime, Jobs, mpsc::Receiver<AppEvent>) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("spotcli-test-{}-{n}", std::process::id()));
+        crate::auth::TokenStore::save(
+            &dir,
+            &crate::auth::StoredCredentials {
+                client_id: "x".into(),
+                access_token: "t".into(),
+                refresh_token: "r".into(),
+                expires_at: i64::MAX,
+            },
+        )
+        .unwrap();
+        let client = Client::from_dir(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let jobs = Jobs { client, handle: runtime.handle().clone(), tx, local: None };
+        (runtime, jobs, rx)
+    }
+
+    fn press(app: &mut App, jobs: &Jobs, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE), jobs);
+    }
+
+    fn track(n: usize) -> Track {
+        Track { uri: format!("spotify:track:{n}"), name: format!("t{n}"), ..Default::default() }
+    }
+
+    fn with_results() -> App {
+        let mut app = App::new();
+        app.tab = Tab::Search;
+        app.search_results = (0..3).map(track).collect();
+        app.searched_for = "abc".into();
+        app.search_input = "abc".into();
+        app
+    }
+
+    #[test]
+    fn debounce_waits_for_quiet_and_min_length() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.search_input = "a".into();
+        app.arm_search_debounce(t0);
+        assert!(app.search_debounce.is_none(), "one character is too short");
+
+        app.search_input = "ab".into();
+        app.arm_search_debounce(t0);
+        assert_eq!(app.search_debounce_left(t0), Some(SEARCH_DEBOUNCE));
+        assert!(!app.take_due_search(t0 + SEARCH_DEBOUNCE - Duration::from_millis(1)));
+        assert!(app.search_debounce.is_some());
+        assert!(app.take_due_search(t0 + SEARCH_DEBOUNCE));
+        assert!(app.search_debounce.is_none(), "fires once");
+        assert!(!app.take_due_search(t0 + SEARCH_DEBOUNCE * 2));
+
+        // A later keystroke pushes the deadline out.
+        app.search_input = "abc".into();
+        app.arm_search_debounce(t0 + Duration::from_millis(100));
+        assert_eq!(
+            app.search_debounce_left(t0 + Duration::from_millis(100)),
+            Some(SEARCH_DEBOUNCE)
+        );
+    }
+
+    #[test]
+    fn debounce_skips_an_unchanged_query() {
+        assert!(wants_search("  hello ", "world"));
+        assert!(!wants_search("  hello ", "hello"));
+        assert!(!wants_search(" h ", ""));
+        let mut app = App::new();
+        app.searched_for = "ab".into();
+        app.search_input = "ab ".into();
+        app.arm_search_debounce(Instant::now());
+        assert!(app.search_debounce.is_none());
+    }
+
+    #[test]
+    fn typing_arms_the_debounce_and_esc_disarms_it() {
+        let (_rt, jobs, _rx) = test_jobs();
+        let mut app = App::new();
+        app.tab = Tab::Search;
+        press(&mut app, &jobs, KeyCode::Char('h'));
+        assert!(app.search_debounce.is_none());
+        press(&mut app, &jobs, KeyCode::Char('i'));
+        assert!(app.search_debounce.is_some());
+        press(&mut app, &jobs, KeyCode::Esc);
+        assert!(app.search_input.is_empty() && app.search_debounce.is_none());
+    }
+
+    #[test]
+    fn focus_moves_between_input_and_results() {
+        let (_rt, jobs, _rx) = test_jobs();
+        let mut app = with_results();
+        assert_eq!(app.search_focus, SearchFocus::Input);
+        // Enter on the already searched query hands over the keyboard.
+        press(&mut app, &jobs, KeyCode::Enter);
+        assert_eq!(app.search_focus, SearchFocus::Results);
+        // Letters are shortcuts now, not text.
+        press(&mut app, &jobs, KeyCode::Char('x'));
+        assert_eq!(app.search_input, "abc");
+        press(&mut app, &jobs, KeyCode::Down);
+        assert_eq!(app.search_cursor, 1);
+        // `i` returns to the input with the text kept.
+        press(&mut app, &jobs, KeyCode::Char('i'));
+        assert_eq!(app.search_focus, SearchFocus::Input);
+        assert_eq!(app.search_input, "abc");
+        // Down goes back; `/` and Esc return again.
+        press(&mut app, &jobs, KeyCode::Down);
+        assert_eq!(app.search_focus, SearchFocus::Results);
+        press(&mut app, &jobs, KeyCode::Char('/'));
+        assert_eq!(app.search_focus, SearchFocus::Input);
+        press(&mut app, &jobs, KeyCode::Down);
+        press(&mut app, &jobs, KeyCode::Esc);
+        assert_eq!(app.search_focus, SearchFocus::Input);
+        assert_eq!(app.search_input, "abc", "Esc in Results keeps the text");
+    }
+
+    #[test]
+    fn down_with_nothing_to_select_stays_in_the_input() {
+        let (_rt, jobs, _rx) = test_jobs();
+        let mut app = App::new();
+        app.tab = Tab::Search;
+        press(&mut app, &jobs, KeyCode::Down);
+        assert_eq!(app.search_focus, SearchFocus::Input);
+    }
+
+    #[test]
+    fn categories_switch_with_arrows_and_digits() {
+        let (_rt, jobs, _rx) = test_jobs();
+        let mut app = with_results();
+        app.search_artists = vec![Artist::default()];
+        press(&mut app, &jobs, KeyCode::Down);
+        press(&mut app, &jobs, KeyCode::Right);
+        assert_eq!(app.search_category, SearchCategory::Artists);
+        press(&mut app, &jobs, KeyCode::Char('4'));
+        assert_eq!(app.search_category, SearchCategory::Playlists);
+        press(&mut app, &jobs, KeyCode::Right);
+        assert_eq!(app.search_category, SearchCategory::Tracks);
+        press(&mut app, &jobs, KeyCode::Left);
+        assert_eq!(app.search_category, SearchCategory::Playlists);
+    }
+
+    #[test]
+    fn playlist_picker_lists_only_editable_playlists() {
+        let mut app = App::new();
+        app.me_id = Some("me".into());
+        let mk = |name: &str, owner: &str, collab: bool| Playlist {
+            id: name.into(),
+            name: name.into(),
+            owner_id: owner.into(),
+            collaborative: collab,
+            ..Default::default()
+        };
+        app.playlists = vec![
+            mk("Mine", "me", false),
+            mk("Followed", "someone", false),
+            mk("Shared", "someone", true),
+        ];
+        assert_eq!(app.writable_playlists(""), vec![0, 2]);
+        assert_eq!(app.writable_playlists("sha"), vec![2]);
+        app.me_id = None;
+        assert_eq!(app.writable_playlists("").len(), 3);
+    }
+
+    #[test]
+    fn picker_keys_navigate_and_cancel() {
+        let (_rt, jobs, _rx) = test_jobs();
+        let mut app = with_results();
+        app.me_id = Some("me".into());
+        app.playlists = (0..3)
+            .map(|i| Playlist { id: format!("p{i}"), name: format!("P{i}"), owner_id: "me".into(), ..Default::default() })
+            .collect();
+        press(&mut app, &jobs, KeyCode::Down);
+        press(&mut app, &jobs, KeyCode::Char('p'));
+        assert!(app.add_to.is_some());
+        press(&mut app, &jobs, KeyCode::Down);
+        press(&mut app, &jobs, KeyCode::Down);
+        assert_eq!(app.add_to.as_ref().unwrap().cursor, 2);
+        press(&mut app, &jobs, KeyCode::Down);
+        assert_eq!(app.add_to.as_ref().unwrap().cursor, 0, "wraps");
+        press(&mut app, &jobs, KeyCode::Char('2'));
+        assert_eq!(app.add_to.as_ref().unwrap().filter, "2");
+        press(&mut app, &jobs, KeyCode::Esc);
+        assert!(app.add_to.is_none());
+        assert_eq!(app.search_focus, SearchFocus::Results);
+    }
+
+    #[test]
+    fn late_search_replies_are_dropped() {
+        let (_rt, jobs, _rx) = test_jobs();
+        let mut app = App::new();
+        app.search_seq = 2;
+        app.search_loading = true;
+        app.on_event(
+            AppEvent::SearchResults {
+                seq: 1,
+                outcome: Ok(SearchPage { tracks: vec![track(1)], more: MoreTracks::None }),
+            },
+            &jobs,
+        );
+        assert!(app.search_results.is_empty() && app.search_loading);
+        app.on_event(
+            AppEvent::SearchResults {
+                seq: 2,
+                outcome: Ok(SearchPage { tracks: vec![track(1)], more: MoreTracks::Web(30) }),
+            },
+            &jobs,
+        );
+        assert_eq!(app.search_results.len(), 1);
+        assert!(!app.search_loading);
+        assert_eq!(app.search_more, MoreTracks::Web(30));
+    }
 
     #[test]
     fn wrap_moves_in_both_directions() {

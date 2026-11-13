@@ -50,20 +50,35 @@ session. `SPOTIFY_CLIENT_ID` works too if you prefer the environment.
 The interface is drawn from a named-token theme (`src/theme.rs`), ported from
 [OpenTUI](https://github.com/anomalyco/opentui)'s design system: background,
 surface, foreground, muted, accent, border, focus, selection, highlight,
-input, cursor, track, thumb, success, warning, and error. Three palettes ship:
+input, cursor, track, thumb, success, warning, and error. Five themes ship:
 
 - `dark` - an explicit dark palette that looks the same in every terminal
 - `light` - an explicit light palette
+- `catppuccin` - Catppuccin Mocha, with a mauve accent
+- `gruvbox` - Gruvbox Dark, with an orange accent
 - `terminal` - inherits the terminal's own 16 colors
 
 ```
 spotcli --theme light
+spotcli --theme gruvbox
 spotcli --theme terminal
 ```
 
+Press `Ctrl+T` in the TUI to cycle through the themes in that order. The
+choice is saved to `settings.json` in the config directory (`~/.config/spotcli`)
+and used the next time you start spotcli.
+
+Theme resolution, highest priority first:
+
+1. the `--theme` flag
+2. the theme saved by `Ctrl+T`
+3. `auto`
+
 The default, `auto`, asks the terminal for its background color over OSC 11
 (the way OpenTUI's renderer theme mode does) and picks dark or light from its
-brightness; if the terminal does not answer, it falls back to dark.
+brightness; if the terminal does not answer, it falls back to dark. Valid
+flag values are `auto`, `dark`, `light`, `catppuccin`, `gruvbox`, and
+`terminal`; an unknown name prints a warning and falls back to `auto`.
 
 ## Build
 
