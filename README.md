@@ -20,8 +20,18 @@ lyrics, and either stream right in the terminal or control any Spotify device.
 
 ## Install
 
+Download the archive for your system from
+[Releases](https://github.com/Topurrra/spotcli/releases/latest):
+
+- **Windows**: unzip and run `install.ps1` (right-click → Run with PowerShell),
+  then open a new terminal
+- **macOS / Linux**: extract and move `spotcli` somewhere on your `PATH`
+  (Linux needs ALSA: `libasound2`)
+
+Or build from source:
+
 ```sh
-cargo install --path .
+cargo install --git https://github.com/Topurrra/spotcli
 ```
 
 ## Sign in
