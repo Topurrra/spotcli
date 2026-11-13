@@ -88,7 +88,7 @@ pub async fn login_streaming(dir: &Path) -> anyhow::Result<()> {
     println!("Opening your browser once more to enable local streaming...");
     let _ = open_browser(&url);
     let code = wait_for_code(STREAMING_REDIRECT_PORT, "/login", &state).await?;
-    let http = reqwest::Client::new();
+    let http = crate::api::http_client();
     let params = [
         ("grant_type", "authorization_code"),
         ("code", code.as_str()),

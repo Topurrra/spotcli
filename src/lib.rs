@@ -10,7 +10,7 @@ pub mod settings;
 pub mod theme_detect;
 mod ui;
 
-pub use api::Client;
+pub use api::{http_client, Client};
 pub use app::App;
 pub use auth::{
     clear_streaming, login, login_streaming, streaming_credentials, StoredCredentials, TokenStore,

@@ -5,6 +5,9 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use spotcli::{config_dir, App, Client, TokenStore};
 
 #[derive(Parser)]
@@ -145,7 +148,7 @@ async fn login(client_id: Option<String>) -> Result<()> {
              3. Run: spotcli login --client-id <your client id>"
         ),
     };
-    let http = reqwest::Client::new();
+    let http = spotcli::http_client();
     spotcli::login(&http, &client_id, &dir).await?;
     println!(
         "Signed in. Credentials saved to {}",

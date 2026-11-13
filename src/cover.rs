@@ -5,7 +5,6 @@
 //! falls back to unicode half-blocks. This module only downloads a track's
 //! cover, decodes it, and keeps it cached for the TUI's lifetime.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct CoverArt {
@@ -13,24 +12,45 @@ pub struct CoverArt {
 }
 
 /// Most covers kept in memory.
-const CACHE_CAP: usize = 32;
-/// Longest edge of a cached cover, in pixels.
-const MAX_EDGE: u32 = 320;
+const CACHE_CAP: usize = 8;
+/// Longest edge of a cached cover, in pixels. The panel is only
+/// COVER_CELLS (12x6 cells), i.e. roughly 100-130 px tall on common fonts
+/// and under 200 px even on very tall cells, so 160 loses nothing visible
+/// while a thumbnail costs ~100 KB instead of ~400 KB at 320.
+const MAX_EDGE: u32 = 160;
 
-static CACHE: OnceLock<Mutex<HashMap<String, Arc<CoverArt>>>> = OnceLock::new();
-static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
-
-fn cache() -> &'static Mutex<HashMap<String, Arc<CoverArt>>> {
-    CACHE.get_or_init(Default::default)
+/// Least-recently-used cover cache: the most recent entry is last.
+struct Lru {
+    entries: Vec<(String, Arc<CoverArt>)>,
 }
 
-fn http() -> &'static reqwest::Client {
-    HTTP.get_or_init(reqwest::Client::new)
+impl Lru {
+    fn get(&mut self, url: &str) -> Option<Arc<CoverArt>> {
+        let index = self.entries.iter().position(|(key, _)| key == url)?;
+        let entry = self.entries.remove(index);
+        let art = entry.1.clone();
+        self.entries.push(entry);
+        Some(art)
+    }
+
+    fn insert(&mut self, url: String, art: Arc<CoverArt>) {
+        self.entries.retain(|(key, _)| *key != url);
+        if self.entries.len() >= CACHE_CAP {
+            self.entries.remove(0);
+        }
+        self.entries.push((url, art));
+    }
+}
+
+static CACHE: OnceLock<Mutex<Lru>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<Lru> {
+    CACHE.get_or_init(|| Mutex::new(Lru { entries: Vec::new() }))
 }
 
 /// An already-fetched cover, when the URL was downloaded this session.
 pub fn cached(url: &str) -> Option<Arc<CoverArt>> {
-    cache().lock().unwrap().get(url).cloned()
+    cache().lock().unwrap().get(url)
 }
 
 /// Download and decode a cover image. Failures return an error the TUI can
@@ -39,7 +59,7 @@ pub async fn load(url: String) -> anyhow::Result<Arc<CoverArt>> {
     if let Some(art) = cached(&url) {
         return Ok(art);
     }
-    let bytes = http()
+    let bytes = crate::api::http_client()
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -47,20 +67,15 @@ pub async fn load(url: String) -> anyhow::Result<Arc<CoverArt>> {
         .error_for_status()?
         .bytes()
         .await?;
-    let cover = CoverArt {
-        image: image::load_from_memory(&bytes)?.thumbnail(MAX_EDGE, MAX_EDGE),
+    // The full-size decode is dropped at the end of this block; only the
+    // thumbnail is kept.
+    let thumb = {
+        let full = image::load_from_memory(&bytes)?;
+        full.thumbnail(MAX_EDGE, MAX_EDGE)
     };
-    let cover = Arc::new(cover);
-    {
-        let mut cache = cache().lock().unwrap();
-        if cache.len() >= CACHE_CAP {
-            // Simple eviction: drop an arbitrary entry.
-            if let Some(key) = cache.keys().next().cloned() {
-                cache.remove(&key);
-            }
-        }
-        cache.insert(url, cover.clone());
-    }
+    drop(bytes);
+    let cover = Arc::new(CoverArt { image: thumb });
+    cache().lock().unwrap().insert(url, cover.clone());
     Ok(cover)
 }
 
@@ -141,7 +156,7 @@ pub fn accent_color(img: &image::DynamicImage) -> Option<(u8, u8, u8)> {
 
 #[cfg(test)]
 mod tests {
-    use super::accent_color;
+    use super::{accent_color, Arc, CoverArt, Lru, CACHE_CAP};
 
     fn solid(r: u8, g: u8, b: u8) -> image::DynamicImage {
         image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(32, 32, image::Rgb([r, g, b])))
@@ -156,6 +171,20 @@ mod tests {
     #[test]
     fn accent_of_gray_is_none() {
         assert_eq!(accent_color(&solid(120, 120, 120)), None);
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used() {
+        let art = || Arc::new(CoverArt { image: solid(1, 2, 3) });
+        let mut lru = Lru { entries: Vec::new() };
+        for i in 0..CACHE_CAP {
+            lru.insert(format!("u{i}"), art());
+        }
+        assert!(lru.get("u0").is_some()); // touch the oldest
+        lru.insert("new".into(), art());
+        assert!(lru.get("u0").is_some());
+        assert!(lru.get("u1").is_none()); // now the least recent
+        assert_eq!(lru.entries.len(), CACHE_CAP);
     }
 
     #[test]

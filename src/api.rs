@@ -1,6 +1,6 @@
 //! An authenticated, rate-limit-aware transport for the Spotify Web API.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reqwest::{Client as HttpClient, Method, StatusCode};
@@ -71,6 +71,20 @@ impl From<reqwest::Error> for ApiError {
     }
 }
 
+/// The process-wide HTTP client (one connection pool and TLS config).
+/// `reqwest::Client` is reference-counted, so the returned clone is cheap.
+/// The default timeout is 15 s; callers needing another set it per request.
+pub fn http_client() -> HttpClient {
+    static HTTP: OnceLock<HttpClient> = OnceLock::new();
+    HTTP.get_or_init(|| {
+        HttpClient::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("static client configuration")
+    })
+    .clone()
+}
+
 /// An authenticated Web API client. Cheap to clone; clones share one token
 /// refresh lock, so concurrent requests never refresh at the same time.
 #[derive(Clone)]
@@ -87,10 +101,7 @@ impl Client {
     pub fn new(tokens: auth::TokenStore) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: HttpClient::builder()
-                    .timeout(Duration::from_secs(15))
-                    .build()
-                    .expect("static client configuration"),
+                http: http_client(),
                 tokens,
             }),
         }
