@@ -62,6 +62,25 @@ struct PlayerState {
     /// When `position_ms` was last confirmed by an event; the UI
     /// interpolates from here between events.
     at: Option<Instant>,
+    /// `Player::load` calls whose `PlayRequestIdChanged` has not arrived yet.
+    pending_loads: u32,
+    /// The play request id of the most recent load; events for any other id
+    /// are stale (a skipped track) and ignored.
+    request_id: Option<u64>,
+}
+
+/// Note that a load is about to be issued: until its request id is announced,
+/// every event is treated as stale.
+fn begin_load(state: &Mutex<PlayerState>) {
+    let mut guard = state_guard(state);
+    guard.pending_loads += 1;
+    guard.request_id = None;
+}
+
+/// Whether `id` belongs to the most recent load.
+fn is_current(state: &Mutex<PlayerState>, id: u64) -> bool {
+    let guard = state_guard(state);
+    guard.pending_loads == 0 && guard.request_id == Some(id)
 }
 
 fn state_guard(state: &Mutex<PlayerState>) -> std::sync::MutexGuard<'_, PlayerState> {
@@ -71,29 +90,30 @@ fn state_guard(state: &Mutex<PlayerState>) -> std::sync::MutexGuard<'_, PlayerSt
     state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Move `state` to the next queue entry and start it. Returns `true` when
-/// the queue is finished.
+/// Move `state` to the next playable queue entry and start it, skipping
+/// entries whose uri does not parse. Returns `true` when the queue is
+/// exhausted.
 fn advance(state: &Mutex<PlayerState>, player: &Arc<Player>) -> bool {
-    let next = {
-        let mut guard = state_guard(state);
-        let index = guard.index + 1;
-        let Some(next) = guard.queue.get(index).cloned() else {
-            guard.is_playing = false;
-            return true;
+    loop {
+        let next = {
+            let mut guard = state_guard(state);
+            let index = guard.index + 1;
+            let Some(next) = guard.queue.get(index).cloned() else {
+                guard.is_playing = false;
+                return true;
+            };
+            guard.index = index;
+            guard.is_playing = true;
+            guard.position_ms = 0;
+            guard.at = Some(Instant::now());
+            next
         };
-        guard.index = index;
-        guard.is_playing = true;
-        guard.position_ms = 0;
-        guard.at = Some(Instant::now());
-        next
-    };
-    if let Ok(track_uri) = SpotifyUri::from_uri(&next.uri) {
-        player.load(track_uri, true, 0);
-    } else {
-        let mut guard = state_guard(state);
-        guard.is_playing = false;
+        if let Ok(track_uri) = SpotifyUri::from_uri(&next.uri) {
+            begin_load(state);
+            player.load(track_uri, true, 0);
+            return false;
+        }
     }
-    false
 }
 
 #[derive(Clone)]
@@ -157,6 +177,19 @@ impl LocalPlayer {
         let mut events = player.get_player_event_channel();
         self.handle.spawn(async move {
             while let Some(event) = events.recv().await {
+                if let PlayerEvent::PlayRequestIdChanged { play_request_id } = event {
+                    let mut guard = state_guard(&state);
+                    guard.pending_loads = guard.pending_loads.saturating_sub(1);
+                    if guard.pending_loads == 0 {
+                        guard.request_id = Some(play_request_id);
+                    }
+                    continue;
+                }
+                if let Some(id) = event.get_play_request_id() {
+                    if !is_current(&state, id) {
+                        continue;
+                    }
+                }
                 match event {
                     PlayerEvent::Playing { position_ms, .. } => {
                         let mut guard = state_guard(&state);
@@ -375,6 +408,7 @@ impl LocalPlayer {
     fn load_uri(&self, uri: &str, start_playing: bool) -> anyhow::Result<()> {
         let track_uri = SpotifyUri::from_uri(uri)
             .map_err(|e| anyhow::anyhow!("not a playable Spotify uri: {uri} ({e})"))?;
+        begin_load(&self.inner.state);
         self.inner.player.load(track_uri, start_playing, 0);
         Ok(())
     }

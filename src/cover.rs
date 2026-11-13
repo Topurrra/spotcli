@@ -12,6 +12,11 @@ pub struct CoverArt {
     pub image: image::DynamicImage,
 }
 
+/// Most covers kept in memory.
+const CACHE_CAP: usize = 32;
+/// Longest edge of a cached cover, in pixels.
+const MAX_EDGE: u32 = 320;
+
 static CACHE: OnceLock<Mutex<HashMap<String, Arc<CoverArt>>>> = OnceLock::new();
 static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -43,16 +48,24 @@ pub async fn load(url: String) -> anyhow::Result<Arc<CoverArt>> {
         .bytes()
         .await?;
     let cover = CoverArt {
-        image: image::load_from_memory(&bytes)?,
+        image: image::load_from_memory(&bytes)?.thumbnail(MAX_EDGE, MAX_EDGE),
     };
     let cover = Arc::new(cover);
-    cache().lock().unwrap().insert(url, cover.clone());
+    {
+        let mut cache = cache().lock().unwrap();
+        if cache.len() >= CACHE_CAP {
+            // Simple eviction: drop an arbitrary entry.
+            if let Some(key) = cache.keys().next().cloned() {
+                cache.remove(&key);
+            }
+        }
+        cache.insert(url, cover.clone());
+    }
     Ok(cover)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[tokio::test]
     async fn load_rejects_garbage() {

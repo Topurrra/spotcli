@@ -107,12 +107,29 @@ fn artists_label(artists: &librespot::metadata::artist::Artists) -> String {
         .join(", ")
 }
 
+/// Percent-encode a search query for a `spotify:search:` context uri: spaces
+/// become `+`, every byte outside the unreserved set becomes `%XX` (so `?`,
+/// `#`, `&`, `%`, `+` and non-ASCII text survive intact).
+fn encode_search_query(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for byte in query.trim().bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Search tracks over the streaming session (no Web API quota, so no
 /// development-mode 403s or shared 503s). Results resolve the top `limit`
 /// matches with full metadata, in search order.
 pub async fn search(session: &Session, query: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
     anyhow::ensure!(!query.trim().is_empty(), "empty query");
-    let context_uri = format!("spotify:search:{}", query.replace(' ', "+"));
+    let context_uri = format!("spotify:search:{}", encode_search_query(query));
     let context = session.spclient().get_context(&context_uri).await?;
 
     let mut uris: Vec<String> = Vec::new();
@@ -278,21 +295,32 @@ pub async fn view_catalog(
     artist_top_tracks(session, &artist_uri).await
 }
 
-/// Synced lyrics for a track, as the ColorLyrics endpoint serves them.
+/// Lyrics for a track, as the ColorLyrics endpoint serves them.
 #[derive(Clone, Debug)]
 pub struct Lyrics {
     pub provider: String,
-    /// `(start time in ms, text)`, ordered by time.
+    /// `(start time in ms, text)`, ordered by time. For unsynced lyrics every
+    /// start time is 0 and carries no meaning.
     pub lines: Vec<(u64, String)>,
+    /// Whether the line timings are real (`syncType` is `LINE_SYNCED`).
+    pub synced: bool,
 }
 
 impl Lyrics {
-    /// The index of the line active at `progress_ms`.
+    /// The index of the line active at `progress_ms`. Unsynced lyrics have no
+    /// timing, so this stays on the first line; use [`Lyrics::current_line`]
+    /// to tell "no active line" apart.
     pub fn active_line(&self, progress_ms: u64) -> usize {
-        self.lines
-            .iter()
-            .rposition(|(start, _)| *start <= progress_ms)
-            .unwrap_or(0)
+        self.current_line(progress_ms).unwrap_or(0)
+    }
+
+    /// The active line at `progress_ms`, or `None` when the lyrics are
+    /// unsynced or the song has not reached its first line yet.
+    pub fn current_line(&self, progress_ms: u64) -> Option<usize> {
+        if !self.synced {
+            return None;
+        }
+        self.lines.iter().rposition(|(start, _)| *start <= progress_ms)
     }
 }
 
@@ -324,10 +352,56 @@ pub async fn lyrics(session: &Session, track_uri: &str) -> anyhow::Result<Option
     if lines.is_empty() {
         return Ok(None);
     }
+    let synced = value
+        .pointer("/lyrics/syncType")
+        .and_then(|v| v.as_str())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("LINE_SYNCED"));
     let provider = value
         .pointer("/lyrics/provider")
         .and_then(|v| v.as_str())
         .unwrap_or("Musixmatch")
         .to_string();
-    Ok(Some(Lyrics { provider, lines }))
+    Ok(Some(Lyrics { provider, lines, synced }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_query_is_percent_encoded() {
+        assert_eq!(encode_search_query("daft punk"), "daft+punk");
+        assert_eq!(encode_search_query("a&b?c#d%e+f"), "a%26b%3Fc%23d%25e%2Bf");
+        assert_eq!(encode_search_query("caf\u{e9}"), "caf%C3%A9");
+        assert_eq!(encode_search_query("  x-y_z.~ "), "x-y_z.~");
+    }
+
+    fn lyrics(synced: bool) -> Lyrics {
+        Lyrics {
+            provider: "test".into(),
+            lines: vec![(1000, "a".into()), (2000, "b".into()), (3000, "c".into())],
+            synced,
+        }
+    }
+
+    #[test]
+    fn synced_lyrics_track_progress() {
+        let l = lyrics(true);
+        assert_eq!(l.current_line(500), None);
+        assert_eq!(l.current_line(1000), Some(0));
+        assert_eq!(l.current_line(2500), Some(1));
+        assert_eq!(l.current_line(99_999), Some(2));
+        assert_eq!(l.active_line(500), 0);
+        assert_eq!(l.active_line(2500), 1);
+    }
+
+    #[test]
+    fn unsynced_lyrics_have_no_active_line() {
+        let l = Lyrics {
+            lines: vec![(0, "a".into()), (0, "b".into()), (0, "c".into())],
+            ..lyrics(false)
+        };
+        assert_eq!(l.current_line(5000), None);
+        assert_eq!(l.active_line(5000), 0);
+    }
 }

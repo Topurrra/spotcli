@@ -60,7 +60,7 @@ pub const PLAYBACK_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 pub const STREAMING_REDIRECT_PORT: u16 = 8898;
 const STREAMING_REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
 
-fn streaming_authorize_url(challenge: &str) -> String {
+fn streaming_authorize_url(challenge: &str, state: &str) -> String {
     // show_dialog forces a full consent, so a browser that is already signed
     // in cannot silently approve without the streaming scope.
     let mut url: reqwest::Url = AUTHORIZE_URL.parse().expect("static URL");
@@ -71,6 +71,7 @@ fn streaming_authorize_url(challenge: &str) -> String {
         .append_pair("redirect_uri", STREAMING_REDIRECT_URI)
         .append_pair("code_challenge_method", "S256")
         .append_pair("code_challenge", challenge)
+        .append_pair("state", state)
         .append_pair("show_dialog", "true");
     url.to_string()
 }
@@ -80,10 +81,11 @@ fn streaming_authorize_url(challenge: &str) -> String {
 /// reusable librespot credential.
 pub async fn login_streaming(dir: &Path) -> anyhow::Result<()> {
     let (verifier, challenge) = pkce_pair();
-    let url = streaming_authorize_url(&challenge);
+    let state = random_state();
+    let url = streaming_authorize_url(&challenge, &state);
     println!("Opening your browser once more to enable local streaming...");
     let _ = open_browser(&url);
-    let code = wait_for_code(STREAMING_REDIRECT_PORT, "/login").await?;
+    let code = wait_for_code(STREAMING_REDIRECT_PORT, "/login", &state).await?;
     let http = reqwest::Client::new();
     let params = [
         ("grant_type", "authorization_code"),
@@ -133,6 +135,13 @@ pub enum AuthError {
     Rejected(String),
 }
 
+/// A random, URL-safe OAuth `state` value.
+pub fn random_state() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// PKCE verifier and its S256 challenge, per RFC 7636.
 pub fn pkce_pair() -> (String, String) {
     let mut bytes = [0u8; 32];
@@ -144,7 +153,7 @@ pub fn pkce_pair() -> (String, String) {
 }
 
 /// The URL the user opens in a browser.
-pub fn authorize_url(client_id: &str, challenge: &str) -> String {
+pub fn authorize_url(client_id: &str, challenge: &str, state: &str) -> String {
     let mut url: reqwest::Url = AUTHORIZE_URL.parse().expect("static URL");
     url.query_pairs_mut()
         .append_pair("response_type", "code")
@@ -152,64 +161,87 @@ pub fn authorize_url(client_id: &str, challenge: &str) -> String {
         .append_pair("scope", &SCOPES.join(" "))
         .append_pair("redirect_uri", REDIRECT_URI)
         .append_pair("code_challenge_method", "S256")
-        .append_pair("code_challenge", challenge);
+        .append_pair("code_challenge", challenge)
+        .append_pair("state", state);
     url.to_string()
 }
 
 /// Wait for Spotify's redirect on the loopback listener and return its code.
 ///
-/// Binds `127.0.0.1:{port}`, serves exactly one request, and answers it with
-/// a small page the user can close.
+/// Binds `127.0.0.1:{port}` and accepts connections until one requests
+/// `expected_path` (browser preconnects, favicon fetches and the like get a
+/// 404), giving up after [`LOGIN_TIMEOUT`] overall. The callback must carry
+/// `expected_state`, or the login is rejected.
 pub async fn wait_for_code(
     port: u16,
     expected_path: &'static str,
+    expected_state: &str,
 ) -> std::result::Result<String, AuthError> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|e| AuthError::Rejected(format!("could not bind port {port}: {e}")))?;
 
-    let stream = tokio::time::timeout(LOGIN_TIMEOUT, listener.accept())
+    let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
+    loop {
+        let (socket, _) = tokio::time::timeout_at(deadline, listener.accept())
+            .await
+            .map_err(|_| AuthError::Timeout(LOGIN_TIMEOUT.as_secs()))?
+            .map_err(|e| AuthError::Rejected(format!("listener failed: {e}")))?;
+        let handled = tokio::time::timeout_at(
+            deadline,
+            handle_callback(socket, expected_path, expected_state),
+        )
         .await
-        .map_err(|_| AuthError::Timeout(LOGIN_TIMEOUT.as_secs()))?
-        .map_err(|e| AuthError::Rejected(format!("listener failed: {e}")))?;
-    let (mut socket, _) = stream;
+        .map_err(|_| AuthError::Timeout(LOGIN_TIMEOUT.as_secs()))?;
+        if let Some(result) = handled {
+            return result;
+        }
+    }
+}
 
+/// Serve one connection. `None` means it was not the callback (answered 404
+/// or sent nothing).
+async fn handle_callback(
+    mut socket: tokio::net::TcpStream,
+    expected_path: &str,
+    expected_state: &str,
+) -> Option<std::result::Result<String, AuthError>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0u8; 8 * 1024];
-    let n = socket
-        .read(&mut buf)
-        .await
-        .map_err(|e| AuthError::Rejected(format!("read failed: {e}")))?;
+    let n = match tokio::time::timeout(Duration::from_secs(10), socket.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return None,
+    };
     let request = String::from_utf8_lossy(&buf[..n]);
-
-    let target = request
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| AuthError::Rejected("malformed request".to_string()))?;
+    let target = request.split_whitespace().nth(1).unwrap_or_default();
     let path = target.split('?').next().unwrap_or_default();
     if path != expected_path {
-        return Err(AuthError::Rejected(format!("unexpected path: {path}")));
+        let _ = socket
+            .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        let _ = socket.shutdown().await;
+        return None;
     }
 
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or_default();
     let mut code = None;
     let mut error = None;
+    let mut state = None;
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         match (parts.next().unwrap_or_default(), parts.next().unwrap_or_default()) {
             ("code", value) if !value.is_empty() => code = Some(value.to_string()),
             ("error", value) if !value.is_empty() => error = Some(value.to_string()),
+            ("state", value) => state = Some(value.to_string()),
             _ => {}
         }
     }
 
-    let (page, _ok) = if error.is_some() || code.is_none() {
-        ("Login failed. You can close this tab and try again.", false)
+    let state_ok = state.as_deref() == Some(expected_state);
+    let page = if error.is_some() || code.is_none() || !state_ok {
+        "Login failed. You can close this tab and try again."
     } else {
-        (
-            "Login complete. You can close this tab and return to the terminal.",
-            true,
-        )
+        "Login complete. You can close this tab and return to the terminal."
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
@@ -220,9 +252,14 @@ pub async fn wait_for_code(
     let _ = socket.shutdown().await;
 
     if let Some(error) = error {
-        return Err(AuthError::Rejected(error));
+        return Some(Err(AuthError::Rejected(error)));
     }
-    code.ok_or_else(|| AuthError::Rejected("no authorization code arrived".to_string()))
+    if !state_ok {
+        return Some(Err(AuthError::Rejected(
+            "the login response did not match this login attempt (state mismatch)".to_string(),
+        )));
+    }
+    Some(code.ok_or_else(|| AuthError::Rejected("no authorization code arrived".to_string())))
 }
 
 /// Exchanged tokens, as Spotify returns them.
@@ -281,13 +318,26 @@ impl TokenStore {
     pub fn save(dir: &Path, credentials: &StoredCredentials) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("credentials.json");
-        let mut file = std::fs::File::create(&path)?;
+        let tmp = dir.join("credentials.json.tmp");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        file.write_all(&serde_json::to_vec_pretty(credentials)?)?;
+        let write = (|| -> std::io::Result<()> {
+            let mut file = options.open(&tmp)?;
+            file.write_all(&serde_json::to_vec_pretty(credentials)?)?;
+            file.sync_all()?;
+            drop(file);
+            // Replaces an existing file on both unix and Windows.
+            std::fs::rename(&tmp, &path)
+        })();
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -297,17 +347,25 @@ impl TokenStore {
     }
 
     /// A valid access token, refreshing first when it is close to expiry.
-    /// A valid access token. When `force` is set, the caller saw a 401 for
-    /// the current token and a refresh is attempted even before expiry.
-    pub async fn access_token(&self, http: &reqwest::Client, force: bool) -> Result<String> {
+    /// `rejected` is the token a request just got a 401 for: a refresh is
+    /// forced even before expiry, unless the stored token has already changed
+    /// since (another request refreshed it), in which case that one is reused.
+    pub async fn access_token(&self, http: &reqwest::Client, rejected: Option<&str>) -> Result<String> {
         let mut credentials = self.credentials.lock().await;
-        if !force && (now_unix() + REFRESH_MARGIN.as_secs() as i64) < credentials.expires_at {
+        let stale = rejected.is_some_and(|token| token == credentials.access_token);
+        if !stale && (now_unix() + REFRESH_MARGIN.as_secs() as i64) < credentials.expires_at {
             return Ok(credentials.access_token.clone());
         }
         let old_refresh = credentials.refresh_token.clone();
         let refreshed = refresh(http, &credentials.client_id, &old_refresh)
             .await
-            .map_err(|e| crate::api::ApiError::Network(e.to_string()))?;
+            .map_err(|e| {
+                if e.downcast_ref::<InvalidGrant>().is_some() {
+                    crate::api::ApiError::SessionExpired
+                } else {
+                    crate::api::ApiError::Network(e.to_string())
+                }
+            })?;
         // Spotify omits refresh_token on a refresh grant; keep the old one then.
         let refresh_token = if refreshed.refresh_token.is_empty() {
             old_refresh
@@ -336,13 +394,14 @@ pub async fn login(
     dir: &Path,
 ) -> anyhow::Result<StoredCredentials> {
     let (verifier, challenge) = pkce_pair();
-    let url = authorize_url(client_id, &challenge);
+    let state = random_state();
+    let url = authorize_url(client_id, &challenge, &state);
     println!("Opening your browser to sign in to Spotify...");
     println!("(If it does not open, visit this URL yourself:)");
     println!("  {url}");
     let _ = open_browser(&url);
 
-    let code = wait_for_code(REDIRECT_PORT, "/callback").await?;
+    let code = wait_for_code(REDIRECT_PORT, "/callback", &state).await?;
     let tokens = exchange(http, client_id, &code, &verifier)
         .await
         .map_err(|e| crate::api::ApiError::Network(e.to_string()))?;
@@ -387,21 +446,25 @@ pub async fn refresh(
     token_request(http, &params).await
 }
 
+/// The refresh token was revoked or expired: the user must log in again.
+#[derive(Debug, thiserror::Error)]
+#[error("your Spotify session expired; run `spotcli login` again")]
+struct InvalidGrant;
+
 async fn token_request(
     http: &reqwest::Client,
     params: &[(&str, &str)],
 ) -> anyhow::Result<Tokens> {
-    let response: serde_json::Value = http
-        .post(TOKEN_URL)
-        .form(params)
-        .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| {
-            anyhow::anyhow!("Spotify refused the token request ({e}); check the client id")
-        })?
-        .json()
-        .await?;
+    let reply = http.post(TOKEN_URL).form(params).send().await?;
+    let status = reply.status();
+    if !status.is_success() {
+        let body = reply.text().await.unwrap_or_default();
+        if body.contains("invalid_grant") {
+            return Err(InvalidGrant.into());
+        }
+        anyhow::bail!("Spotify refused the token request ({status}); check the client id");
+    }
+    let response: serde_json::Value = reply.json().await?;
     let access_token = response
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -452,7 +515,7 @@ mod tests {
 
     #[test]
     fn authorize_url_carries_the_pkce_parameters() {
-        let url = authorize_url("client123", "challenge-abc");
+        let url = authorize_url("client123", "challenge-abc", "state-xyz");
         assert!(url.starts_with("https://accounts.spotify.com/authorize?"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=client123"));
@@ -460,6 +523,7 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("code_challenge=challenge-abc"));
         assert!(url.contains("scope=playlist-read-private"));
+        assert!(url.contains("state=state-xyz"));
     }
 
     fn urlencode(value: &str) -> String {

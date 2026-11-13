@@ -45,5 +45,10 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

@@ -16,6 +16,9 @@ use crate::models::{
 };
 
 const BASE_URL: &str = "https://api.spotify.com/v1";
+const PAGE_SIZE: u32 = 50;
+/// Upper bound on playlists loaded for one user.
+const PLAYLIST_LIMIT: u32 = 500;
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
@@ -92,44 +95,94 @@ impl Client {
         &self.inner.tokens
     }
 
-    /// GET a JSON document, refreshing the token once on a 401.
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        for attempt in 0..2 {
-            let token = self.tokens().access_token(self.http(), attempt > 0).await?;
-            let response = self
-                .http()
-                .get(format!("{BASE_URL}{path}"))
-                .bearer_auth(token)
-                .send()
+    /// Send one authenticated request, handling the two retryable failures:
+    /// a 401 (refresh the token once, unless another request already did) and,
+    /// for idempotent GETs only, a 429 (honor `Retry-After`, capped, once).
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let idempotent = method == Method::GET;
+        let mut rejected: Option<String> = None;
+        let mut refreshed = false;
+        let mut rate_retried = false;
+        loop {
+            let token = self
+                .tokens()
+                .access_token(self.http(), rejected.as_deref())
                 .await?;
+            let mut request = self
+                .http()
+                .request(method.clone(), format!("{BASE_URL}{path}"))
+                .bearer_auth(&token);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request.send().await?;
             match Self::check(response).await {
-                Ok(response) => return response.json().await.map_err(ApiError::from),
-                Err(e) if e.is_auth() && attempt == 0 => continue,
+                Ok(response) => return Ok(response),
+                Err(ApiError::SessionExpired) if !refreshed => {
+                    refreshed = true;
+                    rejected = Some(token);
+                }
+                Err(ApiError::RateLimited { retry_after }) if idempotent && !rate_retried => {
+                    rate_retried = true;
+                    let wait = retry_after.unwrap_or(Duration::from_secs(1));
+                    tokio::time::sleep(wait.min(Duration::from_secs(5))).await;
+                }
                 Err(e) => return Err(e),
             }
         }
-        unreachable!("the loop returns on every branch");
+    }
+
+    /// GET a JSON document.
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let response = self.request(Method::GET, path, None).await?;
+        response.json().await.map_err(ApiError::from)
     }
 
     /// PUT or POST, with an optional JSON body, ignoring the empty reply.
     async fn send(&self, method: Method, path: &str, body: Option<serde_json::Value>) -> Result<()> {
-        for attempt in 0..2 {
-            let token = self.tokens().access_token(self.http(), attempt > 0).await?;
-            let mut request = self
-                .http()
-                .request(method.clone(), format!("{BASE_URL}{path}"))
-                .bearer_auth(token);
-            if let Some(body) = &body {
-                request = request.json(body);
-            }
-            let response = request.send().await?;
-            match Self::check_empty(response).await {
-                Ok(()) => return Ok(()),
-                Err(e) if e.is_auth() && attempt == 0 => continue,
-                Err(e) => return Err(e),
+        self.request(method, path, body.as_ref()).await.map(|_| ())
+    }
+
+    /// Fetch up to `limit` items of a paged collection (`path` has no query
+    /// string). The first page reports `total`; the rest are fetched a few at
+    /// a time and kept in order.
+    async fn paged<T: DeserializeOwned>(&self, path: &str, limit: u32) -> Result<Vec<T>> {
+        use futures::StreamExt as _;
+        let first_size = limit.clamp(1, PAGE_SIZE);
+        let first: RawPaging<T> = self
+            .get(&format!("{path}?limit={first_size}&offset=0"))
+            .await?;
+        let wanted = u64::from(limit).min(first.total);
+        let mut items = first.items;
+        let mut offsets = Vec::new();
+        let mut offset = u64::from(first_size);
+        while offset < wanted {
+            offsets.push(offset);
+            offset += u64::from(PAGE_SIZE);
+        }
+        let pages: Vec<Result<RawPaging<T>>> = futures::stream::iter(offsets)
+            .map(|offset| async move {
+                self.get::<RawPaging<T>>(&format!("{path}?limit={PAGE_SIZE}&offset={offset}"))
+                    .await
+            })
+            .buffered(4)
+            .collect()
+            .await;
+        for page in pages {
+            let page = page?;
+            let done = page.items.is_empty();
+            items.extend(page.items);
+            if done {
+                break;
             }
         }
-        unreachable!("the loop returns on every branch");
+        items.truncate(limit as usize);
+        Ok(items)
     }
 
     async fn check(response: reqwest::Response) -> Result<reqwest::Response> {
@@ -156,10 +209,6 @@ impl Client {
         })
     }
 
-    async fn check_empty(response: reqwest::Response) -> Result<()> {
-        Self::check(response).await.map(|_| ())
-    }
-
     // --- Endpoints ---------------------------------------------------------
 
     /// The signed-in user's profile.
@@ -176,10 +225,10 @@ impl Client {
         })
     }
 
-    /// The user's playlists (first page of 50).
+    /// The user's playlists, following pagination (capped at 500).
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
-        let page: RawPaging<RawPlaylist> = self.get("/me/playlists?limit=50").await?;
-        Ok(page.items.into_iter().map(map_playlist).collect())
+        let items: Vec<RawPlaylist> = self.paged("/me/playlists", PLAYLIST_LIMIT).await?;
+        Ok(items.into_iter().map(map_playlist).collect())
     }
 
     /// A playlist's tracks, following pagination up to `limit` entries.
@@ -198,7 +247,7 @@ impl Client {
             let received = page.items.len() as u32;
             for item in page.items {
                 if let Some(raw) = item.track {
-                    if raw.uri.is_some() {
+                    if is_playable(&raw) {
                         tracks.push(map_track(raw));
                     }
                 }
@@ -211,14 +260,13 @@ impl Client {
         Ok(tracks)
     }
 
-    /// The user's saved (liked) tracks.
+    /// The user's saved (liked) tracks, following pagination up to `limit`.
     pub async fn saved_tracks(&self, limit: u32) -> Result<Vec<Track>> {
-        let page: RawPaging<RawSavedTrack> =
-            self.get(&format!("/me/tracks?limit={}", limit.min(50))).await?;
-        Ok(page
-            .items
+        let items: Vec<RawSavedTrack> = self.paged("/me/tracks", limit).await?;
+        Ok(items
             .into_iter()
             .filter_map(|saved| saved.track)
+            .filter(is_playable)
             .map(map_track)
             .collect())
     }
@@ -231,33 +279,24 @@ impl Client {
             .await?;
         Ok(raw
             .tracks
-            .map(|page| page.items.into_iter().map(map_track).collect())
+            .map(|page| {
+                page.items
+                    .into_iter()
+                    .filter(is_playable)
+                    .map(map_track)
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
     /// The playback state, or `None` when nothing is playing anywhere.
     pub async fn playback(&self) -> Result<Option<Playback>> {
-        for attempt in 0..2 {
-            let token = self.tokens().access_token(self.http(), attempt > 0).await?;
-            let response = self
-                .http()
-                .get(format!("{BASE_URL}/me/player"))
-                .bearer_auth(token)
-                .send()
-                .await?;
-            if response.status() == StatusCode::NO_CONTENT {
-                return Ok(None);
-            }
-            match Self::check(response).await {
-                Ok(response) => {
-                    let raw: RawPlayback = response.json().await.map_err(ApiError::from)?;
-                    return Ok(Some(map_playback(raw)));
-                }
-                Err(e) if e.is_auth() && attempt == 0 => continue,
-                Err(e) => return Err(e),
-            }
+        let response = self.request(Method::GET, "/me/player", None).await?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
         }
-        unreachable!("the loop returns on every branch");
+        let raw: RawPlayback = response.json().await.map_err(ApiError::from)?;
+        Ok(Some(map_playback(raw)))
     }
 
     /// Start playing `uris` on `device_id`, or on the active device.
@@ -370,6 +409,14 @@ impl Client {
 struct RawDeviceList {
     #[serde(default)]
     devices: Vec<RawDevice>,
+}
+
+/// A track the player can stream: a real `spotify:track:` uri (local files
+/// and null-id entries have none).
+fn is_playable(raw: &crate::models::RawTrack) -> bool {
+    raw.uri
+        .as_deref()
+        .is_some_and(|uri| uri.starts_with("spotify:track:") && uri.len() > "spotify:track:".len())
 }
 
 fn device_query(device_id: Option<&str>) -> String {

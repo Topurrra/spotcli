@@ -19,10 +19,16 @@ use crate::player::LocalPlayer;
 use crate::theme::Theme;
 use crate::models::{Device, Playback, Playlist, Track};
 
-/// How long the event loop waits for terminal input between draws.
-const TICK: Duration = Duration::from_millis(100);
-/// How often the real playback state is fetched.
-const PLAYBACK_POLL: Duration = Duration::from_secs(5);
+/// Redraw cadence while something on screen changes with time.
+const ANIM_TICK: Duration = Duration::from_millis(250);
+/// How long the loop blocks for input when nothing is animating.
+const IDLE_TICK: Duration = Duration::from_secs(1);
+/// How often the remote playback state is fetched while playing.
+const PLAYBACK_POLL_PLAYING: Duration = Duration::from_secs(2);
+/// ... and while paused or idle.
+const PLAYBACK_POLL_IDLE: Duration = Duration::from_secs(10);
+/// Cover panel size in terminal cells the image protocol is built for.
+const COVER_CELLS: (u16, u16) = (12, 6);
 /// How long a transient status message stays on screen.
 pub const STATUS_TTL: Duration = Duration::from_secs(4);
 
@@ -81,7 +87,7 @@ pub enum AppEvent {
     /// Album art for `uri` finished rendering.
     Cover {
         uri: String,
-        art: std::sync::Arc<crate::cover::CoverArt>,
+        protocol: Option<ratatui_image::protocol::Protocol>,
     },
     /// Radio continuation tracks for a seed.
     RadioTracks { tracks: Vec<Track> },
@@ -171,7 +177,10 @@ pub struct App {
     /// radio service had nothing new, so do not loop.
     pub(crate) radio_seed: Option<String>,
 
-    pub(crate) status: Option<(String, Instant)>,    pub(crate) pending: usize,
+    pub(crate) status: Option<(String, Instant)>,
+    pub(crate) pending: usize,
+    /// A /me/player poll is awaiting its reply.
+    playback_in_flight: bool,
 }
 
 impl Default for App {
@@ -220,6 +229,7 @@ impl App {
             radio_seed: None,
             status: None,
             pending: 0,
+            playback_in_flight: false,
         }
     }
 
@@ -235,22 +245,45 @@ impl App {
         self.bootstrap(&jobs);
 
         let mut last_poll = Instant::now();
+        // Redraw only when something changed; the first frame always draws.
+        let mut dirty = true;
+        let mut last_draw = Instant::now();
         while !self.should_quit {
-            if self.source == Source::Local {
-                // The built-in player advances its own state; show it live.
-                self.apply_local_snapshot();
+            if dirty {
+                terminal.draw(|frame| crate::ui::draw(frame, self))?;
+                dirty = false;
+                last_draw = Instant::now();
             }
-            terminal.draw(|frame| crate::ui::draw(frame, self))?;
 
-            if event::poll(TICK)? {
-                match event::read()? {
-                    TermEvent::Key(key) => {
-                        if key.kind == KeyEventKind::Press {
-                            self.on_key(key, &jobs);
+            // Time-varying UI (progress gauge, expiring status, spinners)
+            // needs periodic redraws; otherwise block for a long time.
+            let animated = self.is_animated();
+            let mut timeout = if animated { ANIM_TICK } else { IDLE_TICK };
+            if self.source == Source::Remote {
+                let due = self.poll_interval().saturating_sub(last_poll.elapsed());
+                timeout = timeout.min(due.max(Duration::from_millis(1)));
+            }
+            // Wake exactly when the status message expires instead of ticking.
+            if let Some((_, expires)) = self.status.as_ref() {
+                let left = expires.saturating_duration_since(Instant::now());
+                timeout = timeout.min(left.max(Duration::from_millis(1)));
+            }
+            if event::poll(timeout)? {
+                // Drain everything pending so bursts cost one redraw.
+                loop {
+                    match event::read()? {
+                        TermEvent::Key(key) => {
+                            if key.kind == KeyEventKind::Press {
+                                self.on_key(key, &jobs);
+                            }
                         }
+                        TermEvent::Mouse(mouse) => self.on_mouse(mouse, &jobs),
+                        _ => {}
                     }
-                    TermEvent::Mouse(mouse) => self.on_mouse(mouse, &jobs),
-                    _ => {}
+                    dirty = true;
+                    if !event::poll(Duration::ZERO)? {
+                        break;
+                    }
                 }
             }
 
@@ -259,6 +292,7 @@ impl App {
                 if jobs.local.is_none() {
                     jobs.local = self.local.clone();
                 }
+                dirty = true;
             }
 
             self.ensure_cover(&jobs);
@@ -266,9 +300,20 @@ impl App {
                 self.refresh_view(&jobs);
             }
 
-            if self.source == Source::Remote && last_poll.elapsed() >= PLAYBACK_POLL {
+            if self.source == Source::Remote
+                && !self.playback_in_flight
+                && last_poll.elapsed() >= self.poll_interval()
+            {
                 self.refresh_playback(&jobs);
                 last_poll = Instant::now();
+            }
+
+            if self.status.as_ref().is_some_and(|(_, expires)| Instant::now() >= *expires) {
+                self.status = None;
+                dirty = true;
+            }
+            if animated && last_draw.elapsed() >= ANIM_TICK {
+                dirty = true;
             }
         }
         if let Some(local) = self.local.as_ref() {
@@ -317,7 +362,21 @@ impl App {
         jobs.submit(async move { client.playlists().await.map_err(anyhow::Error::from) }, AppEvent::Playlists);
     }
 
+    /// Whether the screen changes by itself with time.
+    fn is_animated(&self) -> bool {
+        self.playback.as_ref().is_some_and(|p| p.is_playing) || self.pending > 0
+    }
+
+    fn poll_interval(&self) -> Duration {
+        if self.playback.as_ref().is_some_and(|p| p.is_playing) {
+            PLAYBACK_POLL_PLAYING
+        } else {
+            PLAYBACK_POLL_IDLE
+        }
+    }
+
     fn refresh_playback(&mut self, jobs: &Jobs) {
+        self.playback_in_flight = true;
         self.pending += 1;
         let client = jobs.client.clone();
         jobs.submit(async move { client.playback().await.map_err(anyhow::Error::from) }, AppEvent::Playback);
@@ -573,11 +632,22 @@ impl App {
         };
         self.cover_request = Some(uri.clone());
         self.pending += 1;
+        let picker = self.picker.clone();
         jobs.submit(
             async move {
-                crate::cover::load(url)
-                    .await
-                    .map(|art| AppEvent::Cover { uri, art })
+                let art = crate::cover::load(url).await?;
+                // Protocol encoding (resize, sixel/kitty/halfblocks) is heavy.
+                let protocol = tokio::task::spawn_blocking(move || {
+                    picker
+                        .new_protocol(
+                            art.image.clone(),
+                            ratatui::layout::Size::new(COVER_CELLS.0, COVER_CELLS.1),
+                            ratatui_image::Resize::Fit(None),
+                        )
+                        .ok()
+                })
+                .await?;
+                Ok(AppEvent::Cover { uri, protocol })
             },
             |result| match result {
                 Ok(event) => event,
@@ -1118,6 +1188,7 @@ impl App {
     fn on_event(&mut self, event: AppEvent, jobs: &Jobs) {
         match event {
             AppEvent::Playback(result) => {
+                self.playback_in_flight = false;
                 self.pending = self.pending.saturating_sub(1);
                 match result {
                     Ok(Some(playback)) => {
@@ -1198,7 +1269,7 @@ impl App {
                     }
                 }
             }
-            AppEvent::Cover { uri, art } => {
+            AppEvent::Cover { uri, protocol } => {
                 self.pending = self.pending.saturating_sub(1);
                 self.cover_request = None;
                 if self
@@ -1207,17 +1278,6 @@ impl App {
                     .and_then(|p| p.track.as_ref())
                     .is_some_and(|track| track.uri == uri)
                 {
-                    // Render into a panel of this many cells, keeping the
-                    // aspect (the protocols letterbox or crop as asked).
-                    let size = ratatui::layout::Size::new(12, 6);
-                    let protocol = self
-                        .picker
-                        .new_protocol(
-                            art.image.clone(),
-                            size,
-                            ratatui_image::Resize::Fit(None),
-                        )
-                        .ok();
                     if let Some(protocol) = protocol {
                         self.cover = Some((uri, protocol));
                     }

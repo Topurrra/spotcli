@@ -55,7 +55,11 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(3)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     let result = runtime.block_on(dispatch(cli, &runtime));
     match result {
         Ok(()) => ExitCode::SUCCESS,

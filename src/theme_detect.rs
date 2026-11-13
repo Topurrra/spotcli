@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 
 /// How long the background query waits for a reply.
-const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Ask the terminal for its background color and judge its brightness.
 ///
