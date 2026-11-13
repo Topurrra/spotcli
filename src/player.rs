@@ -53,8 +53,21 @@ pub struct LocalStatus {
     pub queue_len: usize,
 }
 
+/// What happens when a track finishes in the built-in player.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Repeat {
+    /// Play the queue once, then hand over to radio.
+    #[default]
+    Off,
+    /// Start the queue over after its last track.
+    All,
+    /// Play the current track again.
+    One,
+}
+
 #[derive(Default)]
 struct PlayerState {
+    repeat: Repeat,
     queue: Vec<Track>,
     index: usize,
     is_playing: bool,
@@ -92,12 +105,20 @@ fn state_guard(state: &Mutex<PlayerState>) -> std::sync::MutexGuard<'_, PlayerSt
 
 /// Move `state` to the next playable queue entry and start it, skipping
 /// entries whose uri does not parse. Returns `true` when the queue is
-/// exhausted.
-fn advance(state: &Mutex<PlayerState>, player: &Arc<Player>) -> bool {
-    loop {
+/// exhausted. `finished` is true when the current track played to its end
+/// (repeat-one replays it then; an unavailable track is always skipped).
+fn advance(state: &Mutex<PlayerState>, player: &Arc<Player>, finished: bool) -> bool {
+    // Bounded so a queue of nothing but unplayable entries cannot spin
+    // forever under repeat-all.
+    let attempts = state_guard(state).queue.len().max(1);
+    for attempt in 0..attempts {
         let next = {
             let mut guard = state_guard(state);
-            let index = guard.index + 1;
+            let index = match guard.repeat {
+                Repeat::One if finished && attempt == 0 => guard.index,
+                Repeat::All if guard.index + 1 >= guard.queue.len() => 0,
+                _ => guard.index + 1,
+            };
             let Some(next) = guard.queue.get(index).cloned() else {
                 guard.is_playing = false;
                 return true;
@@ -114,6 +135,8 @@ fn advance(state: &Mutex<PlayerState>, player: &Arc<Player>) -> bool {
             return false;
         }
     }
+    state_guard(state).is_playing = false;
+    true
 }
 
 #[derive(Clone)]
@@ -208,7 +231,7 @@ impl LocalPlayer {
                         let _ = notify.send(LocalSignal::Status);
                     }
                     PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } => {
-                        let ended = advance(&state, &player);
+                        let ended = advance(&state, &player, true);
                         let _ = notify.send(if ended {
                             LocalSignal::Ended
                         } else {
@@ -216,7 +239,7 @@ impl LocalPlayer {
                         });
                     }
                     PlayerEvent::Unavailable { track_id, .. } => {
-                        let ended = advance(&state, &player);
+                        let ended = advance(&state, &player, false);
                         let _ = notify.send(if ended {
                             LocalSignal::Ended
                         } else {
@@ -318,6 +341,11 @@ impl LocalPlayer {
     }
 
     /// Shuffle the part of the queue that has not played yet.
+    /// Choose what happens when a track ends.
+    pub fn set_repeat(&self, repeat: Repeat) {
+        state_guard(&self.inner.state).repeat = repeat;
+    }
+
     pub fn shuffle_queue(&self) {
         use rand::seq::SliceRandom as _;
         let mut guard = state_guard(&self.inner.state);

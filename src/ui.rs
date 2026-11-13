@@ -54,7 +54,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Search => draw_search(frame, app, &theme, chunks[2], &prev),
         Tab::View => draw_view(frame, app, &theme, chunks[2], &prev),
     }
-    draw_player(frame, app, &theme, chunks[3]);
+    let [shuffle_button, repeat_button] = draw_player(frame, app, &theme, chunks[3]);
+    app.zones.shuffle_button = shuffle_button;
+    app.zones.repeat_button = repeat_button;
     draw_footer(frame, app, &theme, chunks[4]);
 }
 
@@ -750,14 +752,14 @@ fn track_table(
 
 // --- Now playing --------------------------------------------------------------------
 
-fn draw_player(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn draw_player(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) -> [Rect; 2] {
     let block = Block::default()
         .style(Style::default().bg(theme.surface_raised))
         .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return [Rect::default(); 2];
     }
 
     let (cw, ch) = COVER_CELLS;
@@ -802,7 +804,7 @@ fn draw_player(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             )),
             rows[2],
         );
-        return;
+        return [Rect::default(); 2];
     };
 
     let track = playback.track.as_ref();
@@ -840,6 +842,12 @@ fn draw_player(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     title_spans.push(Span::styled(truncate(title, title_max).into_owned(), title_style));
     frame.render_widget(Paragraph::new(Line::from(title_spans)), title_area);
     frame.render_widget(Paragraph::new(flags).alignment(Alignment::Right), flags_area);
+    // Click targets: shuffle glyph (plus a cell of slack), then repeat.
+    let flags_x = flags_area.right().saturating_sub(flags_w);
+    let buttons = [
+        Rect::new(flags_x.saturating_sub(1), flags_area.y, 3, 1).intersection(flags_area),
+        Rect::new(flags_x + 2, flags_area.y, flags_w.saturating_sub(2) + 1, 1).intersection(flags_area),
+    ];
 
     // Line 2: artist and album.
     let sub = if album.is_empty() {
@@ -896,6 +904,7 @@ fn draw_player(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         },
         rows[5],
     );
+    buttons
 }
 
 /// "1:12 ━━━━━━●──────── 3:42": accent fill, foreground head.
@@ -1040,6 +1049,20 @@ mod tests {
     fn render(app: &mut App, w: u16, h: u16) {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
+    }
+
+    #[test]
+    fn shuffle_and_repeat_buttons_cover_their_glyphs() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let glyphs = |zone: Rect| -> String {
+            zone.positions().map(|p| buf[(p.x, p.y)].symbol().to_string()).collect()
+        };
+        assert!(glyphs(app.zones.shuffle_button).contains('⇄'));
+        assert!(glyphs(app.zones.repeat_button).contains('⟲'));
+        assert!(!glyphs(app.zones.shuffle_button).contains('⟲'));
     }
 
     #[test]

@@ -68,6 +68,9 @@ pub enum Tab {
 /// Where the list panes rendered last frame: click targets for the mouse.
 #[derive(Clone, Copy, Default)]
 pub struct MouseZones {
+    /// The shuffle and repeat toggles in the now-playing panel.
+    pub shuffle_button: ratatui::layout::Rect,
+    pub repeat_button: ratatui::layout::Rect,
     /// The playlist list items, row 0 being the built-in liked list.
     pub playlists: ratatui::layout::Rect,
     /// The (library or view) track list items minus its heading rows.
@@ -189,6 +192,8 @@ pub struct App {
     local_starting: bool,
     /// Local shuffle state (the player itself cannot unshuffle).
     local_shuffle: bool,
+    /// Repeat mode of the built-in player.
+    local_repeat: crate::player::Repeat,
     /// Monotonic id of the latest search; older replies are dropped.
     search_seq: u64,
     /// When devices were last requested.
@@ -260,6 +265,7 @@ impl App {
             local_playlist_play: None,
             local_starting: false,
             local_shuffle: false,
+            local_repeat: crate::player::Repeat::Off,
             search_seq: 0,
             last_devices_at: Instant::now(),
             picker,
@@ -670,7 +676,12 @@ impl App {
         playback.progress_ms = snapshot.position_ms;
         playback.duration_ms = duration_ms;
         playback.shuffle = shuffle;
-        playback.repeat = "off".to_string();
+        playback.repeat = match self.local_repeat {
+            crate::player::Repeat::Off => "off",
+            crate::player::Repeat::All => "context",
+            crate::player::Repeat::One => "track",
+        }
+        .to_string();
         playback.volume_percent = Some(snapshot.volume_percent);
         playback.device_name = "This terminal (local)".to_string();
         self.playback_at = snapshot.progress_at;
@@ -1135,7 +1146,21 @@ impl App {
 
     fn cycle_repeat(&mut self, jobs: &Jobs) {
         if self.source == Source::Local {
-            self.say("Repeat applies to Spotify devices; local playback runs the list in order");
+            use crate::player::Repeat;
+            self.local_repeat = match self.local_repeat {
+                Repeat::Off => Repeat::All,
+                Repeat::All => Repeat::One,
+                Repeat::One => Repeat::Off,
+            };
+            if let Some(local) = self.local.as_ref() {
+                local.set_repeat(self.local_repeat);
+            }
+            self.apply_local_snapshot();
+            self.say(match self.local_repeat {
+                Repeat::Off => "Repeat off",
+                Repeat::All => "Repeat all",
+                Repeat::One => "Repeat one",
+            });
             return;
         }
         let Some(playback) = self.playback.as_mut() else {
@@ -1229,6 +1254,14 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 use ratatui::layout::Position;
                 let at = Position { x: mouse.column, y: mouse.row };
+                if self.zones.shuffle_button.contains(at) {
+                    self.toggle_shuffle(jobs);
+                    return;
+                }
+                if self.zones.repeat_button.contains(at) {
+                    self.cycle_repeat(jobs);
+                    return;
+                }
                 let row_in = |zone: ratatui::layout::Rect, offset: usize| -> usize {
                     (mouse.row - zone.y) as usize + offset
                 };
@@ -1376,6 +1409,7 @@ impl App {
                         // Forward player state changes into the event queue.
                         let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel();
                         local.watch(signal_tx);
+                        local.set_repeat(self.local_repeat);
                         let event_tx = jobs.tx.clone();
                         jobs.handle.spawn(async move {
                             while let Some(signal) = signal_rx.recv().await {
