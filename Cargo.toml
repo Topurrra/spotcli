@@ -29,7 +29,6 @@ librespot = { version = "0.8.0", default-features = false, features = [
     "rodio-backend",
     "rustls-tls-webpki-roots",
 ] }
-mimalloc = { version = "0.1", default-features = false }
 open = "5"
 rand = "0.9"
 # Batched metadata reads for session-backed playlist browsing.

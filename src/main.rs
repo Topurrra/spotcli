@@ -5,9 +5,6 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use spotcli::{config_dir, App, Client, TokenStore};
 
 #[derive(Parser)]
@@ -59,8 +56,12 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // The work is network I/O and light JSON; two workers keep the UI
+    // responsive, and a small blocking pool (DNS lookups, cover decoding)
+    // avoids idle threads that each hold allocator and stack memory.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(3)
+        .worker_threads(2)
+        .max_blocking_threads(4)
         .enable_all()
         .build()
         .expect("tokio runtime");
