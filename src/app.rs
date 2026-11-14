@@ -2104,6 +2104,10 @@ impl App {
                     self.apply_local_snapshot();
                     self.say_error(message);
                 }
+                crate::player::LocalSignal::Notice(message) => {
+                    self.apply_local_snapshot();
+                    self.say(message);
+                }
             },
             AppEvent::RadioTracks { tracks, .. } => {
                 self.radio_seed = None;
